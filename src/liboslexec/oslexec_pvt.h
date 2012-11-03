@@ -668,7 +668,7 @@ private:
 class OSLEXECPUBLIC ShadingSystemImpl : public ShadingSystem
 {
 public:
-    OSLEXECPUBLIC ShadingSystemImpl (RendererServices *renderer=NULL,
+    ShadingSystemImpl (RendererServices *renderer=NULL,
                        TextureSystem *texturesystem=NULL,
                        ErrorHandler *err=NULL);
     virtual ~ShadingSystemImpl ();
