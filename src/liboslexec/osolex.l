@@ -47,6 +47,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
 %option prefix="oso"
 
+/* Don't use unistd header */
+%option nounistd
 
  /* Define regular expression macros 
   ************************************************/
