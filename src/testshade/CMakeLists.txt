@@ -10,10 +10,12 @@ add_library ("libtestshade" SHARED ${testshade_srcs})
 target_link_libraries (libtestshade oslexec oslcomp oslquery ${OPENIMAGEIO_LIBRARY} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${LLVM_LIBRARY} )
 set_target_properties (libtestshade PROPERTIES PREFIX "")
 install (TARGETS libtestshade
-#         RUNTIME DESTINATION "${BINDIR}" COMPONENT user
+         RUNTIME DESTINATION bin
+#COMPONENT user
          LIBRARY DESTINATION lib 
 #COMPONENT user
-#         ARCHIVE DESTINATION "${LIBDIR}" COMPONENT developer
+         ARCHIVE DESTINATION lib
+#COMPONENT developer
 )
 
 # The 'testshade_dso' executable

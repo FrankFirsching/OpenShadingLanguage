@@ -92,6 +92,7 @@ message (STATUS "Boost libraries    ${Boost_LIBRARIES}")
 
 include_directories (SYSTEM "${Boost_INCLUDE_DIRS}")
 link_directories ("${Boost_LIBRARY_DIRS}")
+add_definitions(-DBOOST_ALL_DYN_LINK)
 
 # end Boost setup
 ###########################################################################
@@ -177,6 +178,31 @@ endif (USE_PARTIO)
 ###########################################################################
 # LLVM library setup
 
+if(MSVC)
+
+# A convenience variable:
+set(LLVM_ROOT "" CACHE PATH "Root of LLVM install.")
+# A bit of a sanity check:
+if( NOT EXISTS ${LLVM_ROOT}/include/llvm )
+    message(FATAL_ERROR "LLVM_ROOT (${LLVM_ROOT}) is not a valid LLVM install")
+endif()
+# We incorporate the CMake features provided by LLVM:
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${LLVM_ROOT}/share/llvm/cmake")
+include(LLVMConfig)
+# Now set the header and library paths:
+include_directories( ${LLVM_INCLUDE_DIRS} )
+link_directories( ${LLVM_LIBRARY_DIRS} )
+add_definitions( ${LLVM_DEFINITIONS} )
+# Let's suppose we want to build a JIT compiler with support for
+# binary code (no interpreter):
+llvm_map_components_to_libraries(LLVM_LIBRARY jit native core ipo BitWriter)
+
+string (REGEX REPLACE "\\." "" OSL_LLVM_VERSION ${LLVM_VERSION})
+message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
+add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
+
+else()
+# Non Windows
 if (LLVM_DIRECTORY)
     set (LLVM_CONFIG "${LLVM_DIRECTORY}/bin/llvm-config")
 else ()
@@ -230,6 +256,7 @@ if (LLVM_LIBRARY AND LLVM_INCLUDES AND LLVM_DIRECTORY AND LLVM_LIB_DIR)
 else ()
   message (FATAL_ERROR "LLVM not found.")
 endif ()
+endif()
 
 # end LLVM library setup
 ###########################################################################
