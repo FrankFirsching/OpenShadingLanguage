@@ -104,8 +104,10 @@ Schematically, we want to create code that resembles the following:
 
 */
 
+#ifndef OSL_LLVM_NO_BITCODE
 extern int osl_llvm_compiled_ops_size;
 extern char osl_llvm_compiled_ops_block[];
+#endif
 
 using namespace OSL::pvt;
 
@@ -1022,13 +1024,13 @@ RuntimeOptimizer::build_llvm_group ()
 
     ASSERT (! m_llvm_module);
     // Load the LLVM bitcode and parse it into a Module
-    const char *data = osl_llvm_compiled_ops_block;
-    llvm::MemoryBuffer* buf = llvm::MemoryBuffer::getMemBuffer (llvm::StringRef(data, osl_llvm_compiled_ops_size));
     std::string err;
 #ifdef OSL_LLVM_NO_BITCODE
-    m_llvm_module = new llvm::Module("llvm_ops", *llvm_context());
+    m_llvm_module = new llvm::Module("llvm_ops", *m_thread->llvm_context);
 #else
     // Load the LLVM bitcode and parse it into a Module
+    const char *data = osl_llvm_compiled_ops_block;
+    llvm::MemoryBuffer* buf = llvm::MemoryBuffer::getMemBuffer (llvm::StringRef(data, osl_llvm_compiled_ops_size));
     m_llvm_module = llvm::ParseBitcodeFile (buf, *m_thread->llvm_context, &err);
     if (err.length())
         m_shadingsys.error ("ParseBitcodeFile returned '%s'\n", err.c_str());
