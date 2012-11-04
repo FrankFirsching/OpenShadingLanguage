@@ -33,6 +33,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "dual_vec.h"
 #include "Imathx.h"
 
+#ifdef _WIN32
+#define garbor_isFinite isfinite
+#else
+#define garbor_isFinite std::isfinite
+#endif
+
 #include <OpenImageIO/fmath.h>
 
 OSL_NAMESPACE_ENTER
@@ -305,7 +311,7 @@ gabor_cell (GaborParams &gp, const Vec3 &c_i, const Dual2<Vec3> &x_c_i,
                 multMatrix (gp.local, x_k_i, xkit);
                 Dual2<Vec2> x_k_i_t = make_Vec2 (comp(xkit,0), comp(xkit,1));
                 Dual2<float> gk = gabor_kernel (w_i_t_s_f, omega_i_t_s_f, phi_i_t_s_f, a_i_t_s_f, x_k_i_t); // 2D
-                if (! std::isfinite(gk.val())) {
+                if (! garbor_isFinite(gk.val())) {
                     // Numeric failure of the filtered version.  Fall
                     // back on the unfiltered.
                     gk = gabor_kernel (gp.weight, omega_i, phi_i, gp.a, x_k_i);  // 3D

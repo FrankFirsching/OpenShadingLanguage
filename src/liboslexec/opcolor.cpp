@@ -41,6 +41,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "oslexec_pvt.h"
 #include "dual.h"
 
+#ifdef _WIN32
+// Compute exp(x) - 1 without loss of precision for small values of x.
+double expm1(double x)
+{
+  if (fabs(x) < 1e-5)
+    return x + 0.5*x*x;
+  else
+    return exp(x) - 1.0;
+}
+#endif
+
 
 OSL_NAMESPACE_ENTER
 namespace pvt {

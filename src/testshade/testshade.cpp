@@ -32,7 +32,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <string>
 #include <vector>
 #include <cmath>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 
 #include <OpenImageIO/imageio.h>
 #include <OpenImageIO/imagebuf.h>

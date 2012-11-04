@@ -30,7 +30,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vector>
 #include <string>
 #include <cstdio>
+
+#ifdef _WIN32
+#include <io.h>
+const int R_OK = 4;
+#else
 #include <unistd.h>
+#endif
 
 #include "oslquery.h"
 #include "../liboslexec/osoreader.h"
