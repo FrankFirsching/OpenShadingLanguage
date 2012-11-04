@@ -91,10 +91,23 @@ static ustring u_index ("index");
 
 /// Macro that defines the full declaration of an LLVM generator.
 /// 
+#ifdef _WIN32
+#define LLVMGEN(name) \
+  bool name (LLVMGEN_ARGS); \
+  }; \
+  OSL_NAMESPACE_EXIT \
+  bool name (LLVMGEN_ARGS) { return OSL::pvt::name(rop, opnum); } \
+  OSL_NAMESPACE_ENTER \
+  namespace pvt { \
+  bool name (LLVMGEN_ARGS)
+#define LLVMGEN_FORWARD(name)  bool name (LLVMGEN_ARGS)
+#else
 #define LLVMGEN(name)  bool name (LLVMGEN_ARGS)
+#define LLVMGEN_FORWARD(name)  bool name (LLVMGEN_ARGS)
+#endif
 
 // Forward decl
-LLVMGEN (llvm_gen_generic);
+LLVMGEN_FORWARD (llvm_gen_generic);
 
 
 

@@ -916,8 +916,18 @@ private:
 
 /// Macro that defines the full declaration of a shadeop constant-folder.
 /// 
+#ifdef _WIN32
+#define DECLFOLDER(name) \
+  int name (FOLDARGSDECL); \
+  }; \
+  OSL_NAMESPACE_EXIT \
+  int name (FOLDARGSDECL) { return OSL::pvt::name(rop, opnum); } \
+  OSL_NAMESPACE_ENTER \
+  namespace pvt { \
+  int name (FOLDARGSDECL)
+#else
 #define DECLFOLDER(name)  int name (FOLDARGSDECL)
-
+#endif
 
 
 }; // namespace pvt
