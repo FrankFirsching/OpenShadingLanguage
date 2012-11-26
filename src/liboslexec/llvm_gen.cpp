@@ -3440,5 +3440,13 @@ LLVMGEN (llvm_gen_return)
 
 
 
+LLVMGEN (llvm_gen_end)
+{
+    // Dummy routine needed only for the op_descriptor table
+    return false;
+}
+
+
+
 }; // namespace pvt
 OSL_NAMESPACE_EXIT

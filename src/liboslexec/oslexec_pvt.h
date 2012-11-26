@@ -457,13 +457,13 @@ public:
     /// Return a begin/end Symbol* pair for the set of param symbols
     /// that is suitable to pass as a range for BOOST_FOREACH.
     friend std::pair<Symbol *,Symbol *> param_range (ShaderInstance *i) {
-        return std::pair<Symbol*,Symbol*> (i->symbol(i->firstparam()),
-                                           i->symbol(i->lastparam()));
+        return std::pair<Symbol*,Symbol*> (&i->m_instsymbols[i->firstparam()],
+                                           &i->m_instsymbols[i->lastparam()]);
     }
 
     friend std::pair<const Symbol *,const Symbol *> param_range (const ShaderInstance *i) {
-        return std::pair<const Symbol*,const Symbol*> (i->symbol(i->firstparam()),
-                                                       i->symbol(i->lastparam()));
+        return std::pair<const Symbol*,const Symbol*> (&i->m_instsymbols[i->firstparam()],
+                                                       &i->m_instsymbols[i->lastparam()]);
     }
 
     int Psym () const { return m_Psym; }
@@ -676,6 +676,8 @@ public:
     virtual bool attribute (const std::string &name, TypeDesc type, const void *val);
     virtual bool getattribute (const std::string &name, TypeDesc type, void *val);
 
+    virtual bool LoadMemoryCompiledShader (const char *shadername,
+                                   const char *buffer);
     virtual bool Parameter (const char *name, TypeDesc t, const void *val);
     virtual bool Shader (const char *shaderusage,
                          const char *shadername=NULL,

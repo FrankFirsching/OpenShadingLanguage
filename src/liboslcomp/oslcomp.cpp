@@ -152,7 +152,7 @@ preprocess (const std::string &filename,
         }
 
         instream.unsetf (std::ios::skipws);
-        std::string instring = OIIO::Strutil::format("#include \"%s\"\n", stdinclude)
+        std::string instring = OIIO::Strutil::format("#include \"%s\"\n", stdinclude.c_str())
             + std::string (std::istreambuf_iterator<char>(instream.rdbuf()),
                            std::istreambuf_iterator<char>());
         instream.close ();
@@ -281,10 +281,8 @@ preprocess (const std::string &filename,
         fb.close ();
     }
 
-    if (cpppipe)
-        pclose (cpppipe);
-
-    return true;
+    // Test for error in exit status
+    return (pclose(cpppipe) == 0);
 }
 
 #endif
@@ -292,7 +290,8 @@ preprocess (const std::string &filename,
 
 bool
 OSLCompilerImpl::compile (const std::string &filename,
-                          const std::vector<std::string> &options)
+                          const std::vector<std::string> &options,
+                          const std::string &stdoslpath)
 {
     if (! OIIO::Filesystem::exists (filename)) {
         error (ustring(), 0, "Input file \"%s\" not found", filename.c_str());
@@ -313,32 +312,36 @@ OSLCompilerImpl::compile (const std::string &filename,
 
     // Determine where the installed shader include directory is, and
     // look for ../shaders/stdosl.h and force it to include.
-    std::string program = OIIO::Sysutil::this_program_path ();
-    if (program.size()) {
-        boost::filesystem::path path (program);  // our program
-        path = path.parent_path ();  // now the bin dir of our program
-        path = path.parent_path ();  // now the parent dir
-        path = path / "shaders";
-        bool found = false;
-        if (OIIO::Filesystem::exists (path.string())) {
-#ifdef USE_BOOST_WAVE
-            includepaths.push_back(path.string());
-#else
-            // pass along to cpp
-            cppoptions += "\"-I";
-            cppoptions += path.string();
-            cppoptions += "\" ";
-#endif
-            path = path / "stdosl.h";
+    if (stdoslpath.empty()) {
+        std::string program = OIIO::Sysutil::this_program_path ();
+        if (program.size()) {
+            boost::filesystem::path path (program);  // our program
+            path = path.parent_path ();  // now the bin dir of our program
+            path = path.parent_path ();  // now the parent dir
+            path = path / "shaders";
+            bool found = false;
             if (OIIO::Filesystem::exists (path.string())) {
-                stdinclude = path.string();
-                found = true;
+#ifdef USE_BOOST_WAVE
+                includepaths.push_back(path.string());
+#else
+                // pass along to cpp
+                cppoptions += "\"-I";
+                cppoptions += path.string();
+                cppoptions += "\" ";
+#endif
+                path = path / "stdosl.h";
+                if (OIIO::Filesystem::exists (path.string())) {
+                    stdinclude = path.string();
+                    found = true;
+                }
             }
+            if (! found)
+                warning (ustring(filename), 0, "Unable to find \"%s\"",
+                         path.string().c_str());
         }
-        if (! found)
-            warning (ustring(filename), 0, "Unable to find \"%s\"",
-                     path.string().c_str());
     }
+    else
+        stdinclude = stdoslpath;
 
     m_output_filename.clear ();
     bool preprocess_only = false;
@@ -401,7 +404,10 @@ OSLCompilerImpl::compile (const std::string &filename,
         delete m_lexer;
 
         if (! parseerr) {
-            shader()->typecheck ();
+            if (shader())
+                shader()->typecheck ();
+            else
+                error (ustring(), 0, "No shader function defined");
         }
 
         // Print the parse tree if there were no errors
@@ -440,36 +446,36 @@ struct GlobalTable {
     TypeSpec type;
 };
 
-static GlobalTable globals[] = {
-    { "P", TypeDesc::TypePoint },
-    { "I", TypeDesc::TypeVector },
-    { "N", TypeDesc::TypeNormal },
-    { "Ng", TypeDesc::TypeNormal },
-    { "u", TypeDesc::TypeFloat },
-    { "v", TypeDesc::TypeFloat },
-    { "dPdu", TypeDesc::TypeVector },
-    { "dPdv", TypeDesc::TypeVector },
-#if 0
-    // Light variables -- we don't seem to be on a route to support this
-    // kind of light shader, so comment these out for now.
-    { "L", TypeDesc::TypeVector },
-    { "Cl", TypeDesc::TypeColor },
-    { "Ns", TypeDesc::TypeNormal },
-    { "Pl", TypeDesc::TypePoint },
-    { "Nl", TypeDesc::TypeNormal },
-#endif
-    { "Ps", TypeDesc::TypePoint },
-    { "Ci", TypeSpec (TypeDesc::TypeColor, true) },
-    { "time", TypeDesc::TypeFloat },
-    { "dtime", TypeDesc::TypeFloat },
-    { "dPdtime", TypeDesc::TypeVector },
-    { NULL }
-};
-
 
 void
 OSLCompilerImpl::initialize_globals ()
 {
+    static GlobalTable globals[] = {
+        { "P", TypeDesc::TypePoint },
+        { "I", TypeDesc::TypeVector },
+        { "N", TypeDesc::TypeNormal },
+        { "Ng", TypeDesc::TypeNormal },
+        { "u", TypeDesc::TypeFloat },
+        { "v", TypeDesc::TypeFloat },
+        { "dPdu", TypeDesc::TypeVector },
+        { "dPdv", TypeDesc::TypeVector },
+    #if 0
+        // Light variables -- we don't seem to be on a route to support this
+        // kind of light shader, so comment these out for now.
+        { "L", TypeDesc::TypeVector },
+        { "Cl", TypeDesc::TypeColor },
+        { "Ns", TypeDesc::TypeNormal },
+        { "Pl", TypeDesc::TypePoint },
+        { "Nl", TypeDesc::TypeNormal },
+    #endif
+        { "Ps", TypeDesc::TypePoint },
+        { "Ci", TypeSpec (TypeDesc::TypeColor, true) },
+        { "time", TypeDesc::TypeFloat },
+        { "dtime", TypeDesc::TypeFloat },
+        { "dPdtime", TypeDesc::TypeVector },
+        { NULL }
+    };
+
     for (int i = 0;  globals[i].name;  ++i) {
         Symbol *s = new Symbol (ustring(globals[i].name), globals[i].type,
                                 SymTypeGlobal);
