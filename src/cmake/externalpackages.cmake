@@ -197,9 +197,16 @@ add_definitions( ${LLVM_DEFINITIONS} )
 # binary code (no interpreter):
 llvm_map_components_to_libraries(LLVM_LIBRARY jit native core ipo BitWriter)
 
-string (REGEX REPLACE "\\." "" OSL_LLVM_VERSION ${LLVM_VERSION})
-message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
-add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
+if(LLVM_DEBUG_SUFFIX)
+	set(LLVM_LIBRARY_RELEASE ${LLVM_LIBRARY})
+	set(LLVM_LIBRARY)
+	foreach(lib ${LLVM_LIBRARY_RELEASE})
+		set(modifiedLib debug "${lib}_d" optimized ${lib})
+		list(APPEND LLVM_LIBRARY ${modifiedLib})
+	endforeach()
+endif()
+
+set(LLVM_VERSION ${LLVM_PACKAGE_VERSION})
 
 else()
 # Non Windows
@@ -232,12 +239,6 @@ message (STATUS "LLVM lib dir  = ${LLVM_LIB_DIR}")
 if (LLVM_LIBRARY AND LLVM_INCLUDES AND LLVM_DIRECTORY AND LLVM_LIB_DIR)
   # ensure include directory is added (in case of non-standard locations
   include_directories (BEFORE "${LLVM_INCLUDES}")
-  # Extract any wayward dots or "svn" suffixes from the version to yield
-  # an integer version number we can use to make compilation decisions.
-  string (REGEX REPLACE "\\." "" OSL_LLVM_VERSION ${LLVM_VERSION})
-  string (REGEX REPLACE "svn" "" OSL_LLVM_VERSION ${OSL_LLVM_VERSION})
-  message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
-  add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
   if (LLVM_STATIC)
     # if static LLVM libraries were requested, use llvm-config to generate
     # the list of what libraries we need, and substitute that in the right
@@ -257,6 +258,13 @@ else ()
   message (FATAL_ERROR "LLVM not found.")
 endif ()
 endif()
+
+# Extract any wayward dots or "svn" suffixes from the version to yield
+# an integer version number we can use to make compilation decisions.
+string (REGEX REPLACE "\\." "" OSL_LLVM_VERSION ${LLVM_VERSION})
+string (REGEX REPLACE "svn" "" OSL_LLVM_VERSION ${OSL_LLVM_VERSION})
+message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
+add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
 
 # end LLVM library setup
 ###########################################################################

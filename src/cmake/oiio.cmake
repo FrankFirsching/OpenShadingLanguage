@@ -12,9 +12,14 @@ endif ()
 
 MESSAGE ( STATUS "OPENIMAGEIOHOME = ${OPENIMAGEIOHOME}" )
 
-find_library ( OPENIMAGEIO_LIBRARY
+find_library ( OPENIMAGEIO_LIBRARY_RELEASE
                NAMES OpenImageIO
                PATHS ${OPENIMAGEIOHOME}/lib )
+find_library ( OPENIMAGEIO_LIBRARY_DEBUG
+               NAMES OpenImageIO_d
+               PATHS ${OPENIMAGEIOHOME}/lib )
+set( OPENIMAGEIO_LIBRARY debug ${OPENIMAGEIO_LIBRARY_DEBUG}
+                         optimized ${OPENIMAGEIO_LIBRARY_RELEASE} )
 find_path ( OPENIMAGEIO_INCLUDES OpenImageIO/imageio.h
             ${OPENIMAGEIOHOME}/include )
 IF (OPENIMAGEIO_INCLUDES AND OPENIMAGEIO_LIBRARY )
