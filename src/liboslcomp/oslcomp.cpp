@@ -32,7 +32,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <fstream>
 #include <cstdio>
 #include <streambuf>
-#ifdef __GNUC__
+#if defined(__GNUC__) && !defined(_LIBCPP_VERSION) && !defined(USE_BOOST_WAVE)
 # include <ext/stdio_filebuf.h>
 #endif
 #include <cstdio>
@@ -152,9 +152,16 @@ preprocess (const std::string &filename,
         }
 
         instream.unsetf (std::ios::skipws);
-        std::string instring = OIIO::Strutil::format("#include \"%s\"\n", stdinclude.c_str())
-            + std::string (std::istreambuf_iterator<char>(instream.rdbuf()),
-                           std::istreambuf_iterator<char>());
+        std::string instring;
+
+        if (!stdinclude.empty())
+            instring = OIIO::Strutil::format("#include \"%s\"\n", stdinclude.c_str());
+        else
+            instring = "\n";
+
+        instring += std::string (std::istreambuf_iterator<char>(instream.rdbuf()),
+                                 std::istreambuf_iterator<char>());
+
         instream.close ();
 
         typedef boost::wave::cpplexer::lex_token<> token_type;
@@ -252,7 +259,7 @@ preprocess (const std::string &filename,
     cppcommand += options;
 
     if (! stdinclude.empty())
-        cppcommand += std::string("-include ") + stdinclude + " ";
+        cppcommand += std::string("-include \"") + stdinclude + "\" ";
 
     cppcommand += "\"";
     cppcommand += filename;
@@ -261,7 +268,7 @@ preprocess (const std::string &filename,
     // std::cout << "cpp command:\n>" << cppcommand << "<\n";
     FILE *cpppipe = popen (cppcommand.c_str(), "r");
 
-#ifdef __GNUC__
+#if defined(__GNUC__) && !defined(_LIBCPP_VERSION)
     __gnu_cxx::stdio_filebuf<char> fb (cpppipe, std::ios::in);
 #else
     std::filebuf fb (cpppipe);
@@ -528,16 +535,24 @@ void
 OSLCompilerImpl::write_oso_const_value (const ConstantSymbol *sym) const
 {
     ASSERT (sym);
-    if (sym->typespec().is_string())
-        oso ("\"%s\"", sym->strval().c_str());
-    else if (sym->typespec().is_int())
-        oso ("%d", sym->intval());
-    else if (sym->typespec().is_float())
-        oso ("%.8g", sym->floatval());
-    else if (sym->typespec().is_triple())
-        oso ("%.8g %.8g %.8g", sym->vecval()[0], sym->vecval()[1], sym->vecval()[2]);
+    TypeDesc type = sym->typespec().simpletype();
+    TypeDesc elemtype = type.elementtype();
+    int nelements = std::max (1, type.arraylen);
+    if (elemtype == TypeDesc::STRING)
+        for (int i = 0;  i < nelements;  ++i)
+            oso ("\"%s\"%s", sym->strval(i).c_str(), nelements>1 ? " " : "");
+    else if (elemtype == TypeDesc::INT)
+        for (int i = 0;  i < nelements;  ++i)
+            oso ("%d%s", sym->intval(i), nelements>1 ? " " : "");
+    else if (elemtype == TypeDesc::FLOAT)
+        for (int i = 0;  i < nelements;  ++i)
+            oso ("%.8g%s", sym->floatval(i), nelements>1 ? " " : "");
+    else if (equivalent (elemtype, TypeDesc::TypeVector))
+        for (int i = 0;  i < nelements;  ++i)
+            oso ("%.8g %.8g %.8g%s", sym->vecval(i)[0], sym->vecval(i)[1],
+                 sym->vecval(i)[2], nelements>1 ? " " : "");
     else {
-        ASSERT (0 && "Only know how to output const vals that are single int, float, string");
+        ASSERT (0 && "Don't know how to output this constant type");
     }
 }
 
@@ -1069,18 +1084,37 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
 }
 
 
+// This has O(n^2) memory usage, so only for debugging
+//#define DEBUG_SYMBOL_DEPENDENCIES
 
 // Add to the dependency map that "A depends on B".
 static void
 add_dependency (SymDependencyMap &dmap, const Symbol *A, const Symbol *B)
 {
     dmap[A].insert (B);
+
+#ifdef DEBUG_SYMBOL_DEPENDENCIES
     // Perform unification -- all of B's dependencies are now
     // dependencies of A.
     BOOST_FOREACH (const Symbol *r, dmap[B])
         dmap[A].insert (r);
+#endif
 }
 
+
+static void
+mark_symbol_derivatives (SymDependencyMap &dmap, SymPtrSet &visited, const Symbol *sym)
+{
+    BOOST_FOREACH (const Symbol *r, dmap[sym]) {
+		if (visited.find(r) == visited.end()) {
+			visited.insert(r);
+
+			const_cast<Symbol *>(r)->has_derivs (true);
+
+			mark_symbol_derivatives(dmap, visited, r);
+		}
+	}
+}
 
 
 /// Run through all the ops, for each one marking its 'written'
@@ -1157,11 +1191,11 @@ OSLCompilerImpl::track_variable_dependencies ()
         }
     }
 
-    // Mark all symbols needing derivatives as such
-    BOOST_FOREACH (const Symbol *d, m_symdeps[m_derivsym])
-        const_cast<Symbol *>(d)->has_derivs (true);
+    // Recursively tag all symbols that need derivatives
+    SymPtrSet visited;
+    mark_symbol_derivatives (m_symdeps, visited, m_derivsym);
 
-#if 0
+#ifdef DEBUG_SYMBOL_DEPENDENCIES
     // Helpful for debugging
 
     std::cerr << "track_variable_dependencies\n";

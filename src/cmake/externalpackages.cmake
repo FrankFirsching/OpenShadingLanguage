@@ -2,14 +2,13 @@
 # Find libraries
 
 setup_path (THIRD_PARTY_TOOLS_HOME 
-#            "${PROJECT_SOURCE_DIR}/../../external/dist/${platform}"
             "unknown"
             "Location of third party libraries in the external project")
 
 # Add all third party tool directories to the include and library paths so
 # that they'll be correctly found by the various FIND_PACKAGE() invocations.
-if (THIRD_PARTY_TOOLS_HOME AND EXISTS ${THIRD_PARTY_TOOLS_HOME})
-    set (CMAKE_INCLUDE_PATH "${THIRD_PARTY_TOOLS_HOME}/include" ${CMAKE_INCLUDE_PATH})
+if (THIRD_PARTY_TOOLS_HOME AND EXISTS "${THIRD_PARTY_TOOLS_HOME}")
+    set (CMAKE_INCLUDE_PATH "${THIRD_PARTY_TOOLS_HOME}/include" "${CMAKE_INCLUDE_PATH}")
     # Detect third party tools which have been successfully built using the
     # lock files which are placed there by the external project Makefile.
     file (GLOB _external_dir_lockfiles "${THIRD_PARTY_TOOLS_HOME}/*.d")
@@ -35,24 +34,9 @@ endif ()
 ###########################################################################
 # IlmBase setup
 
-# example of using setup_var instead:
-#setup_var (ILMBASE_VERSION 1.0.1 "Version of the ILMBase library")
-setup_string (ILMBASE_VERSION 1.0.1
-              "Version of the ILMBase library")
-mark_as_advanced (ILMBASE_VERSION)
-setup_path (ILMBASE_HOME "${THIRD_PARTY_TOOLS_HOME}"
-            "Location of the ILMBase library install")
-mark_as_advanced (ILMBASE_HOME)
-
 find_package (IlmBase REQUIRED)
 
-if (ILMBASE_FOUND)
-    include_directories ("${ILMBASE_INCLUDE_DIR}")
-    include_directories ("${ILMBASE_INCLUDE_DIR}/OpenEXR")
-    message (STATUS "ILMBASE_INCLUDE_DIR=${ILMBASE_INCLUDE_DIR}")
-else ()
-    message (STATUS "ILMBASE not found!")
-endif ()
+include_directories ("${ILMBASE_INCLUDE_DIR}")
 
 macro (LINK_ILMBASE target)
     target_link_libraries (${target} ${ILMBASE_LIBRARIES})
@@ -67,28 +51,38 @@ endmacro ()
 
 message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
 
-set (Boost_ADDITIONAL_VERSIONS "1.51" "1.50" "1.49" "1.48"
-                               "1.47" "1.46" "1.45"
-                               "1.44" "1.43" "1.42" "1.41" "1.40")
-#set (Boost_USE_STATIC_LIBS   ON)
+if (NOT DEFINED Boost_ADDITIONAL_VERSIONS)
+  set (Boost_ADDITIONAL_VERSIONS "1.54" "1.53" "1.52" "1.51" "1.50"
+                                 "1.49" "1.48" "1.47" "1.46" "1.45" "1.44" 
+                                 "1.43" "1.43.0" "1.42" "1.42.0")
+endif ()
+if (LINKSTATIC)
+    set (Boost_USE_STATIC_LIBS   ON)
+endif ()
 set (Boost_USE_MULTITHREADED ON)
 if (BOOST_CUSTOM)
     set (Boost_FOUND true)
+    # N.B. For a custom version, the caller had better set up the variables
+    # Boost_VERSION, Boost_INCLUDE_DIRS, Boost_LIBRARY_DIRS, Boost_LIBRARIES.
 else ()
     set (Boost_COMPONENTS filesystem regex system thread)
     if (USE_BOOST_WAVE)
         list (APPEND Boost_COMPONENTS wave)
     endif ()
 
-    find_package (Boost 1.40 REQUIRED 
+    find_package (Boost 1.42 REQUIRED 
                   COMPONENTS ${Boost_COMPONENTS}
                  )
 endif ()
 
-message (STATUS "Boost found ${Boost_FOUND} ")
-message (STATUS "Boost include dirs ${Boost_INCLUDE_DIRS}")
-message (STATUS "Boost library dirs ${Boost_LIBRARY_DIRS}")
-message (STATUS "Boost libraries    ${Boost_LIBRARIES}")
+if (VERBOSE)
+    message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
+    message (STATUS "Boost found ${Boost_FOUND} ")
+    message (STATUS "Boost version      ${Boost_VERSION}")
+    message (STATUS "Boost include dirs ${Boost_INCLUDE_DIRS}")
+    message (STATUS "Boost library dirs ${Boost_LIBRARY_DIRS}")
+    message (STATUS "Boost libraries    ${Boost_LIBRARIES}")
+endif ()
 
 include_directories (SYSTEM "${Boost_INCLUDE_DIRS}")
 link_directories ("${Boost_LIBRARY_DIRS}")
@@ -99,67 +93,24 @@ add_definitions(-DBOOST_ALL_DYN_LINK)
 
 
 ###########################################################################
-# TBB (Intel Thread Building Blocks) setup
-
-setup_path (TBB_HOME "${THIRD_PARTY_TOOLS_HOME}"
-            "Location of the TBB library install")
-mark_as_advanced (TBB_HOME)
-if (USE_TBB)
-    set (TBB_VERSION 22_004oss)
-    if (MSVC)
-        find_library (TBB_LIBRARY
-                      NAMES tbb
-                      PATHS ${TBB_HOME}/lib
-                      PATHS ${THIRD_PARTY_TOOLS_HOME}/lib/
-                      ${TBB_HOME}/tbb-${TBB_VERSION}/lib/
-                     )
-        find_library (TBB_DEBUG_LIBRARY
-                      NAMES tbb_debug
-                      PATHS ${TBB_HOME}/lib
-                      PATHS ${THIRD_PARTY_TOOLS_HOME}/lib/
-                      ${TBB_HOME}/tbb-${TBB_VERSION}/lib/)
-    endif (MSVC)
-    find_path (TBB_INCLUDES tbb/tbb_stddef.h
-               ${TBB_HOME}/include/tbb${TBB_VERSION}
-               ${THIRD_PARTY_TOOLS}/include/tbb${TBB_VERSION}
-               ${PROJECT_SOURCE_DIR}/include
-               ${OPENIMAGEIOHOME}/include/OpenImageIO
-              )
-    if (TBB_INCLUDES OR TBB_LIBRARY)
-        set (TBB_FOUND TRUE)
-        message (STATUS "TBB includes = ${TBB_INCLUDES}")
-        message (STATUS "TBB library = ${TBB_LIBRARY}")
-        add_definitions ("-DUSE_TBB=1")
-    else ()
-        message (STATUS "TBB not found")
-    endif ()
-else ()
-    add_definitions ("-DUSE_TBB=0")
-    message (STATUS "TBB will not be used")
-    set(TBB_INCLUDES "")
-    set(TBB_LIBRARY "")
-endif ()
-
-# end TBB setup
-###########################################################################
-
-###########################################################################
 # Partio
 
 find_package (ZLIB)
 if (USE_PARTIO)
     find_library (PARTIO_LIBRARIES
                   NAMES partio
-                  PATHS ${PARTIO_HOME}/lib)
+                  PATHS "${PARTIO_HOME}/lib")
     find_path (PARTIO_INCLUDE_DIR
                NAMES Partio.h
-               PATHS ${PARTIO_HOME}/include)
+               PATHS "${PARTIO_HOME}/include")
     if (PARTIO_INCLUDE_DIR AND PARTIO_LIBRARIES)
         set (PARTIO_FOUND TRUE)
         add_definitions ("-DUSE_PARTIO=1")
         include_directories ("${PARTIO_INCLUDE_DIR}")
-        message (STATUS "Partio include = ${PARTIO_INCLUDE_DIR}")
-        message (STATUS "Partio library = ${PARTIO_LIBRARIES}")
+        if (VERBOSE)
+            message (STATUS "Partio include = ${PARTIO_INCLUDE_DIR}")
+            message (STATUS "Partio library = ${PARTIO_LIBRARIES}")
+        endif ()
     else ()
         add_definitions ("-DUSE_PARTIO=0")
         set (PARTIO_FOUND FALSE)
@@ -172,6 +123,20 @@ else ()
 endif (USE_PARTIO)
 
 # end GL Extension Wrangler library setup
+###########################################################################
+
+
+###########################################################################
+# Pugixml setup.  Normally we just use the version bundled with oiio, but
+# some linux distros are quite particular about having separate packages so we
+# allow this to be overridden to use the distro-provided package if desired.
+if (USE_EXTERNAL_PUGIXML)
+    find_package (PugiXML REQUIRED)
+    # insert include path to pugixml first, to ensure that the external
+    # pugixml is found, and not the one in OIIO's include directory.
+    include_directories (BEFORE "${PUGIXML_INCLUDE_DIR}")
+endif()
+# end Pugixml setup
 ###########################################################################
 
 
@@ -190,12 +155,14 @@ endif()
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${LLVM_ROOT}/share/llvm/cmake")
 include(LLVMConfig)
 # Now set the header and library paths:
+SET( LLVM_INCLUDES ${LLVM_INCLUDE_DIRS} )
 include_directories( ${LLVM_INCLUDE_DIRS} )
+SET( LLVM_LIB_DIR ${LLVM_LIBRARY_DIRS} )
 link_directories( ${LLVM_LIBRARY_DIRS} )
 add_definitions( ${LLVM_DEFINITIONS} )
 # Let's suppose we want to build a JIT compiler with support for
 # binary code (no interpreter):
-llvm_map_components_to_libraries(LLVM_LIBRARY jit native core ipo BitWriter)
+llvm_map_components_to_libraries(LLVM_LIBRARY jit native core ipo BitWriter BitReader)
 
 if(LLVM_DEBUG_SUFFIX)
 	set(LLVM_LIBRARY_RELEASE ${LLVM_LIBRARY})
@@ -210,61 +177,79 @@ set(LLVM_VERSION ${LLVM_PACKAGE_VERSION})
 
 else()
 # Non Windows
-if (LLVM_DIRECTORY)
-    set (LLVM_CONFIG "${LLVM_DIRECTORY}/bin/llvm-config")
-else ()
-    set (LLVM_CONFIG llvm-config)
-endif ()
-execute_process (COMMAND ${LLVM_CONFIG} --version
-                 OUTPUT_VARIABLE LLVM_VERSION
-	         OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process (COMMAND ${LLVM_CONFIG} --prefix
-                 OUTPUT_VARIABLE LLVM_DIRECTORY
-	         OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process (COMMAND ${LLVM_CONFIG} --libdir
-                 OUTPUT_VARIABLE LLVM_LIB_DIR
-  	         OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process (COMMAND ${LLVM_CONFIG} --includedir
-                 OUTPUT_VARIABLE LLVM_INCLUDES
-  	         OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+# try to find llvm-config, with a specific version if specified
+if(LLVM_DIRECTORY)
+  FIND_PROGRAM(LLVM_CONFIG llvm-config-${LLVM_VERSION} HINTS "${LLVM_DIRECTORY}/bin" NO_CMAKE_PATH)
+  if(NOT LLVM_CONFIG)
+    FIND_PROGRAM(LLVM_CONFIG llvm-config HINTS "${LLVM_DIRECTORY}/bin" NO_CMAKE_PATH)
+  endif()
+else()
+  FIND_PROGRAM(LLVM_CONFIG llvm-config-${LLVM_VERSION})
+  if(NOT LLVM_CONFIG)
+    FIND_PROGRAM(LLVM_CONFIG llvm-config)
+  endif()
+endif()
+
+if(NOT LLVM_DIRECTORY OR EXISTS ${LLVM_CONFIG})
+  execute_process (COMMAND ${LLVM_CONFIG} --version
+       OUTPUT_VARIABLE LLVM_VERSION
+       OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process (COMMAND ${LLVM_CONFIG} --prefix
+       OUTPUT_VARIABLE LLVM_DIRECTORY
+       OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process (COMMAND ${LLVM_CONFIG} --libdir
+       OUTPUT_VARIABLE LLVM_LIB_DIR
+       OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process (COMMAND ${LLVM_CONFIG} --includedir
+       OUTPUT_VARIABLE LLVM_INCLUDES
+       OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+
 find_library ( LLVM_LIBRARY
                NAMES LLVM-${LLVM_VERSION}
                PATHS ${LLVM_LIB_DIR})
-message (STATUS "LLVM version  = ${LLVM_VERSION}")
-message (STATUS "LLVM dir      = ${LLVM_DIRECTORY}")
-message (STATUS "LLVM includes = ${LLVM_INCLUDES}")
-message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
-message (STATUS "LLVM lib dir  = ${LLVM_LIB_DIR}")
+endif() # Windows/Linux branch
 
-if (LLVM_LIBRARY AND LLVM_INCLUDES AND LLVM_DIRECTORY AND LLVM_LIB_DIR)
+if (VERBOSE)
+    message (STATUS "LLVM version  = ${LLVM_VERSION}")
+    message (STATUS "LLVM dir      = ${LLVM_DIRECTORY}")
+    message (STATUS "LLVM includes = ${LLVM_INCLUDES}")
+    message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
+    message (STATUS "LLVM lib dir  = ${LLVM_LIB_DIR}")
+endif ()
+
+# shared llvm library may not be available, this is not an error if we use LLVM_STATIC.
+if ((LLVM_LIBRARY OR LLVM_STATIC) AND LLVM_INCLUDES AND LLVM_DIRECTORY AND LLVM_LIB_DIR)
   # ensure include directory is added (in case of non-standard locations
   include_directories (BEFORE "${LLVM_INCLUDES}")
+  if (NOT OSL_LLVM_VERSION)
+      # Extract and concatenate major & minor, remove wayward patches,
+      # dots, and "svn" or other suffixes.
+      string (REGEX REPLACE "([0-9]+)\\.([0-9]+).*" "\\1\\2" OSL_LLVM_VERSION ${LLVM_VERSION})
+  endif ()
+  add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
   if (LLVM_STATIC)
     # if static LLVM libraries were requested, use llvm-config to generate
     # the list of what libraries we need, and substitute that in the right
     # way for LLVM_LIBRARY.
-    set (LLVM_LIBRARY "")
-    execute_process (COMMAND ${LLVM_CONFIG} --libs
-                 OUTPUT_VARIABLE llvm_library_list
-	         OUTPUT_STRIP_TRAILING_WHITESPACE)
-    string (REPLACE "-l" "" llvm_library_list ${llvm_library_list})
-    string (REPLACE " " ";" llvm_library_list ${llvm_library_list})
-    foreach (f ${llvm_library_list})
-      list (APPEND LLVM_LIBRARY "${LLVM_LIB_DIR}/lib${f}.a")
-    endforeach ()
+    execute_process (COMMAND ${LLVM_CONFIG} --libfiles
+                     OUTPUT_VARIABLE LLVM_LIBRARY
+                     OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string (REPLACE " " ";" LLVM_LIBRARY ${LLVM_LIBRARY})
   endif ()
-  message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
+  if (VERBOSE)
+      message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
+      message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
+  endif ()
+
+
+  if (NOT LLVM_LIBRARY)
+    message (FATAL_ERROR "LLVM library not found.")
+  endif()
 else ()
   message (FATAL_ERROR "LLVM not found.")
 endif ()
-endif()
-
-# Extract any wayward dots or "svn" suffixes from the version to yield
-# an integer version number we can use to make compilation decisions.
-string (REGEX REPLACE "\\." "" OSL_LLVM_VERSION ${LLVM_VERSION})
-string (REGEX REPLACE "svn" "" OSL_LLVM_VERSION ${OSL_LLVM_VERSION})
-message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
-add_definitions ("-DOSL_LLVM_VERSION=${OSL_LLVM_VERSION}")
 
 # end LLVM library setup
 ###########################################################################

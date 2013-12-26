@@ -34,6 +34,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ///
 /////////////////////////////////////////////////////////////////////////
 
+#include <OpenImageIO/fmath.h>
 
 #include <iostream>
 #include <cmath>
@@ -41,20 +42,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "oslexec_pvt.h"
 #include "dual.h"
 
-#ifdef _WIN32
-// Compute exp(x) - 1 without loss of precision for small values of x.
-double expm1(double x)
-{
-  if (fabs(x) < 1e-5)
-    return x + 0.5*x*x;
-  else
-    return exp(x) - 1.0;
-}
+#ifdef _MSC_VER
+using OIIO::expm1;
 #endif
-
 
 OSL_NAMESPACE_ENTER
 namespace pvt {
+
+// This symbol is strictly to force linkage of this file when building
+// static library.
+int opcolor_cpp_dummy = 1;
+
 
 namespace {
 
@@ -514,5 +512,5 @@ OSL_SHADEOP void osl_luminance_dfdv (void *sg, void *out, void *c)
 
 
 
-}; // namespace pvt
+} // namespace pvt
 OSL_NAMESPACE_EXIT
