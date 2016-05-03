@@ -989,6 +989,8 @@ BackendLLVM::run ()
     OIIO::spin_lock lock (mutex);
 #endif
 
+#if 0 /*FIXME!!!*/
+
 #ifdef OSL_LLVM_NO_BITCODE
     ll.module (ll.new_module ("llvm_ops"));
 #else
@@ -999,7 +1001,8 @@ BackendLLVM::run ()
         shadingcontext()->error ("ParseBitcodeFile returned '%s'\n", err.c_str());
     ASSERT (ll.module());
 #endif
-
+#endif
+    
     // Create the ExecutionEngine
     if (! ll.make_jit_execengine (&err)) {
         shadingcontext()->error ("Failed to create engine: %s\n", err.c_str());

@@ -33,6 +33,40 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/argparse.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/sysutil.h>
+
+
+#if 1
+
+int
+main (int argc, char *argv[])
+{
+#if 0
+    getargs (argc, argv);
+
+    // Test simple functions
+    test_int_func();
+    test_triple_func();
+
+    if (memtest) {
+        for (int i = 0; i < memtest; ++i) {
+            IntFuncOfTwoInts f = test_big_func (i==0);
+            int r = f (42, 42);
+            ASSERT (r == 84);
+        }
+        std::cout << "After " << memtest << " stupid functions compiled:\n";
+        std::cout << "   RSS memory = "
+                  << OIIO::Strutil::memformat(OIIO::Sysutil::memory_used()) << "\n";
+    }
+#endif
+    return 0;
+}
+
+
+
+
+#else
+
+
 #include "OSL/llvm_util.h"
 
 
@@ -256,3 +290,5 @@ main (int argc, char *argv[])
 
     return 0;
 }
+
+#endif

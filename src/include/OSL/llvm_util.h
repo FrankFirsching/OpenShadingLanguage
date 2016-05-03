@@ -106,7 +106,7 @@ public:
     llvm::Module *module ();
 
     /// Set the current module to m.
-    // void module (llvm::Module *m);
+    void module (llvm::Module *m);
 
     /// Create a new empty module, make it the current module.
     llvm::Module *new_module (const char *id = "default");
@@ -516,7 +516,7 @@ private:
     }
 
     void SetupLLVM ();
-    void setup_llvm_datatype_aliases (llvm::Context *context);
+    void setup_llvm_datatype_aliases (llvm::LLVMContext *context);
 
     class Impl;
     std::unique_ptr<Impl> m_impl;

@@ -137,15 +137,15 @@ public:
     friend class LLVM_Util;
     typedef llvm::orc::ObjectLinkingLayer<> ObjectLayer;
     typedef llvm::orc::IRCompileLayer<ObjectLayer> CompileLayer;
-    typedef CompileLayer::ModuleSetHadleT ModuleHandle;
+    typedef CompileLayer::ModuleSetHandleT ModuleHandle;
 private:
     std::unique_ptr<llvm::TargetMachine> target_machine;
     std::unique_ptr<llvm::Module> module; // current module
 
     // JIT:
-    llvm::DataLayout data_layout;
-    ObjectLayer objectlayer;
-    CompileLayer compilelayer;
+    // llvm::DataLayout data_layout;
+    // ObjectLayer objectlayer;
+    // CompileLayer compilelayer;
 
 
 };
@@ -189,19 +189,19 @@ LLVM_Util::LLVM_Util (int debuglevel)
 {
     SetupLLVM ();
 
-    m_context = new llvm::LLVMContext();
+    m_llvm_context = new llvm::LLVMContext();
     // FIXME: Can we use LLVMGetGlobalContext()? What are the implications
     // of sharing a context across threads or LLVM_Util instances?
 
-    setup_llvm_datatype_aliases (m_context);
+    setup_llvm_datatype_aliases (m_llvm_context);
 
-    m_impl->m_target_machine = EngineBuilder().selectTarget();
+    // m_impl->m_target_machine = llvm::EngineBuilder().selectTarget();
 }
 
 
 
 void
-LLVM_Util::setup_llvm_datatypes (llvm::Context *context)
+LLVM_Util::setup_llvm_datatype_aliases (llvm::LLVMContext *context)
 {
     // Set up aliases for types we use over and over
     m_llvm_type_float = (llvm::Type *) llvm::Type::getFloatTy (*context);
@@ -238,7 +238,7 @@ LLVM_Util::~LLVM_Util ()
     delete m_llvm_module_passes;
     delete m_llvm_func_passes;
     delete m_builder;
-    module (NULL);
+//    module (NULL);
     // DO NOT delete m_llvm_jitmm;  // just the dummy wrapper around the real MM
 }
 
@@ -279,18 +279,18 @@ LLVM_Util::SetupLLVM ()
 llvm::Module *
 LLVM_Util::module ()
 {
-    if (! impl()->m_module)
+    if (! impl()->module)
         new_module ();
     return impl()->module.get();
 }
 
 
 
-// void
-// LLVM_Util::module (llvm::Module *m)
-// {
-//     impl()->module.reset (m);
-// }
+void
+LLVM_Util::module (llvm::Module *m)
+{
+    impl()->module.reset (m);
+}
 
 
 
@@ -449,12 +449,12 @@ LLVM_Util::setup_optimization_passes (int optlevel)
     // understand if we explicitly break it into individual LLVM versions.
 
     m_llvm_func_passes = new llvm::legacy::FunctionPassManager(module());
-    llvm::legacy::FunctionPassManager &fpm (*m_llvm_func_passes);
-    fpm.add (new llvm::DataLayoutPass());
+    // llvm::legacy::FunctionPassManager &fpm (*m_llvm_func_passes);
+//    fpm.add (new llvm::DataLayoutPass());
 
     m_llvm_module_passes = new llvm::legacy::PassManager;
     llvm::legacy::PassManager &mpm (*m_llvm_module_passes);
-    mpm.add (new llvm::DataLayoutPass());
+    // mpm.add (new llvm::DataLayoutPass());
 
     if (optlevel >= 1 && optlevel <= 3) {
 #if OSL_LLVM_VERSION <= 34
@@ -621,10 +621,11 @@ LLVM_Util::make_function (const std::string &name, bool fastcall,
 llvm::Value *
 LLVM_Util::current_function_arg (int a)
 {
+#
     llvm::Function::arg_iterator arg_it = current_function()->arg_begin();
     for (int i = 0;  i < a;  ++i)
         ++arg_it;
-    return arg_it;
+    return llvm::cast<llvm::Value>(arg_it);
 }
 
 
@@ -1086,8 +1087,9 @@ LLVM_Util::op_memset (llvm::Value *ptr, int val, llvm::Value *len, int align)
                                                     llvm::APInt(8, val));
     // Non-volatile (allow optimizer to move it around as it wishes
     // and even remove it if it can prove it's useless)
-    builder().CreateCall5 (func, ptr, fill_val, len, constant(align),
-                           constant_bool(false));
+    llvm::Value *args[] = { ptr, fill_val, len, constant(align),
+                            constant_bool(false) };
+    builder().CreateCall (func, args);
 }
 
 
@@ -1109,8 +1111,9 @@ LLVM_Util::op_memcpy (llvm::Value *dst, llvm::Value *src, int len, int align)
 
     // Non-volatile (allow optimizer to move it around as it wishes
     // and even remove it if it can prove it's useless)
-    builder().CreateCall5 (func, dst, src,
-                           constant(len), constant(align), constant_bool(false));
+    llvm::Value *args[] = { dst, src, constant(len), constant(align),
+                            constant_bool(false) };
+    builder().CreateCall (func, args);
 }
 
 
@@ -1142,7 +1145,7 @@ LLVM_Util::GEP (llvm::Value *ptr, llvm::Value *elem)
 llvm::Value *
 LLVM_Util::GEP (llvm::Value *ptr, int elem)
 {
-    return builder().CreateConstGEP1_32 (ptr, elem);
+    return builder().CreateConstGEP1_64 (ptr, elem);
 }
 
 
@@ -1150,7 +1153,7 @@ LLVM_Util::GEP (llvm::Value *ptr, int elem)
 llvm::Value *
 LLVM_Util::GEP (llvm::Value *ptr, int elem1, int elem2)
 {
-    return builder().CreateConstGEP2_32 (ptr, elem1, elem2);
+    return builder().CreateConstGEP2_64 (ptr, elem1, elem2);
 }
 
 
