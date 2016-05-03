@@ -29,19 +29,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include "export.h"
-#include "oslconfig.h"
+#include "oslversion.h"
 
-#include <memory>
 #include <vector>
 
 #ifndef OSL_LLVM_VERSION
 #  include <llvm/Config/config.h>
 #  define OSL_LLVM_VERSION (LLVM_VERSION_MAJOR*10+LLVM_VERSION_MINOR)
 #endif
-
-#if OSL_LLVM_VERSION < 38
-#  include "llvm_util_old.h"
-#else
+#if OSL_LLVM_VERSION < 34 || OSL_LLVM_VERSION > 35
+#  error "llvm_util_old.h is only for OLD JIT, requires LLVM 3.4 or 3.5"
+#endif
 
 
 #ifdef LLVM_NAMESPACE
@@ -61,7 +59,6 @@ namespace llvm {
   class PointerType;
   class Type;
   class Value;
-  class TargetMachine;
   template<bool preserveNames, typename T, typename Inserter> class IRBuilder;
   template<bool preserveNames> class IRBuilderDefaultInserter;
   namespace legacy {
@@ -103,18 +100,21 @@ public:
 
     /// Return a pointer to the current module.  Make a new one if
     /// necessary.
-    llvm::Module *module ();
+    llvm::Module *module () {
+        if (! m_llvm_module)
+            m_llvm_module = new_module();
+        return m_llvm_module;
+    }
 
     /// Set the current module to m.
-    // void module (llvm::Module *m);
+    void module (llvm::Module *m) { m_llvm_module = m; }
 
-    /// Create a new empty module, make it the current module.
+    /// Create a new empty module.
     llvm::Module *new_module (const char *id = "default");
 
     /// Create a new module, populated with functions from the buffer
-    /// bitcode[0..size-1], make it the current module.  The name identifies
-    /// the buffer.  If err is not NULL, error messages will be stored
-    /// there.
+    /// bitcode[0..size-1].  The name identifies the buffer.  If err is not
+    /// NULL, error messages will be stored there.
     llvm::Module *module_from_bitcode (const char *bitcode, size_t size,
                                        const std::string &name=std::string(),
                                        std::string *err=NULL);
@@ -516,17 +516,12 @@ private:
     }
 
     void SetupLLVM ();
-    void setup_llvm_datatype_aliases (llvm::Context *context);
 
-    class Impl;
-    std::unique_ptr<Impl> m_impl;
-    Impl *impl() { return m_impl.get(); }
 
     int m_debug;
     PerThreadInfo *m_thread;
     llvm::LLVMContext *m_llvm_context;
-    // std::unique_ptr<llvm::Module> m_llvm_module;
-    // std::unique_ptr<llvm::TargetMachine> m_target_machine;
+    llvm::Module *m_llvm_module;
     IRBuilder *m_builder;
     OSL_Dummy_JITMemoryManager *m_llvm_jitmm;
     llvm::Function *m_current_function;
@@ -560,6 +555,3 @@ private:
 
 }; // namespace pvt
 OSL_NAMESPACE_EXIT
-
-
-#endif

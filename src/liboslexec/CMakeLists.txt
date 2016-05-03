@@ -13,8 +13,15 @@ SET ( liboslexec_srcs
           opclosure.cpp
           shadeimage.cpp
           backendllvm.cpp
-          llvm_gen.cpp llvm_instance.cpp llvm_util.cpp
+          llvm_gen.cpp llvm_instance.cpp
+#          llvm_util.cpp llvm_util_old.cpp
     )
+
+if (${OSL_LLVM_VERSION} LESS 38)
+    list (APPEND liboslexec_srcs llvm_util_old)
+else ()
+    list (APPEND liboslexec_srcs llvm_util)
+endif ()
 
 # oslcomp symbols used in oslexec
 if (NOT BUILDSTATIC)
