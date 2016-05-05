@@ -37,9 +37,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #if 1
 
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/Orc/CompileUtils.h>
 #include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
+#include <llvm/ExecutionEngine/Orc/LambdaResolver.h>
 #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/IRBuilder.h>
@@ -59,14 +61,101 @@ make_unique_name (OIIO::string_view prefix = "___")
 }
 
 
-llvm::Value *
-current_function_arg (llvm::Function *func, int a)
-{
-    llvm::Function::arg_iterator arg_it = func->arg_begin();
-    while (a-- > 0)
-        ++arg_it;
-    return llvm::cast<llvm::Value>(arg_it);
-}
+class SimpleJIT {
+public:
+    typedef llvm::orc::ObjectLinkingLayer<> ObjLayerT;
+    typedef llvm::orc::IRCompileLayer<ObjLayerT> CompileLayerT;
+    typedef CompileLayerT::ModuleSetHandleT ModuleHandleT;
+
+
+    SimpleJIT () {
+        initialize_llvm ();
+
+        // Grab an LLVM context, target machine, and data layout. These can be
+        // reused for many modules.
+        llvm_context.reset (new llvm::LLVMContext()); /* S */
+        llvm_target_machine.reset (llvm::EngineBuilder().selectTarget()); /* TM */
+        llvm_data_layout.reset (new llvm::DataLayout (llvm_target_machine->createDataLayout()));
+        inttype = llvm::Type::getInt32Ty (*llvm_context);
+
+        // Set up ORC JIT. Can be used for many modules.
+        orc_compilelayer.reset (new CompileLayerT(orc_objlayer,
+                                                  llvm::orc::SimpleCompiler(*llvm_target_machine)));
+    }
+
+    // Initialize LLVM generally
+    void initialize_llvm () {
+        llvm::InitializeAllTargets();
+        // llvm::InitializeAllTargetInfos();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+        llvm::InitializeAllAsmParsers();
+        // llvm::InitializeAllDisassemblers();
+    }
+
+    // Create a module. We can put as many functions in here as we want,
+    // but we JIT it all at once and then we don't add to it again.
+    llvm::Module *new_module () {
+        llvm_module.reset (new llvm::Module (make_unique_name("jit_module_"),
+                                             *llvm_context));
+        llvm_module->setDataLayout (*llvm_data_layout);
+        return llvm_module.get ();
+    }
+
+    // Create a function. (Empty for now)
+    llvm::Function *make_function (const std::string &name) {
+        llvm::Type *params[] = { inttype, inttype };
+        llvm::FunctionType *functype = llvm::FunctionType::get (inttype, params, false/*varargs*/);
+        llvm::Constant *func_const = llvm_module->getOrInsertFunction (name, functype);
+        return current_func = llvm::cast<llvm::Function>(func_const);
+    }
+
+    llvm::BasicBlock *new_basic_block (OIIO::string_view basename="") {
+        if (! builder)
+            builder.reset (new llvm::IRBuilder<>(*llvm_context));
+        if (basename.empty())
+            basename = OIIO::string_view("block_");
+        llvm::BasicBlock *block = llvm::BasicBlock::Create (*llvm_context,
+                                                            std::string(basename),
+                                                            current_func);
+        builder->SetInsertPoint (block);
+        return current_block = block;
+    }
+
+    llvm::Value * current_function_arg (int a) {
+        llvm::Function::arg_iterator arg_it = current_func->arg_begin();
+        while (a-- > 0)
+            ++arg_it;
+        return llvm::cast<llvm::Value>(arg_it);
+    }
+
+    void module_done () {
+        // MCJIT?
+        std::string engine_errors;
+        llvm::EngineBuilder engine_builder (std::move(llvm_module));
+        engine_builder.setEngineKind (llvm::EngineKind::JIT)
+                      .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
+                      .setErrorStr (&engine_errors);
+        llvm_exec.reset (engine_builder.create());
+        llvm_exec->finalizeObject ();   // Necessary?
+    }
+
+    void * get_compiled_function (llvm::Function *func) {
+        return llvm_exec->getPointerToFunction (func);
+    }
+
+    std::unique_ptr<llvm::LLVMContext> llvm_context;
+    std::unique_ptr<llvm::TargetMachine> llvm_target_machine;
+    std::unique_ptr<llvm::DataLayout> llvm_data_layout;
+    ObjLayerT orc_objlayer;
+    std::unique_ptr<CompileLayerT> orc_compilelayer;
+    std::unique_ptr<llvm::Module> llvm_module;  // current module
+    llvm::IntegerType *inttype = NULL;
+    std::unique_ptr<llvm::IRBuilder<> > builder;
+    llvm::Function *current_func = NULL;
+    llvm::BasicBlock *current_block = NULL;
+    std::unique_ptr<llvm::ExecutionEngine> llvm_exec;
+};
 
 
 
@@ -76,68 +165,50 @@ main (int argc, char *argv[])
     {
     std::cout << "running llvmutil_test...\n";
 
-    // Initialize LLVM generally
-    llvm::InitializeAllTargets();
-    // llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmPrinters();
-    llvm::InitializeAllAsmParsers();
-    // llvm::InitializeAllDisassemblers();
+    SimpleJIT jit;
 
-    // Grab an LLVM context, target machine, and data layout. These can be
-    // reused for many modules.
-    std::unique_ptr<llvm::LLVMContext> llvm_context (new llvm::LLVMContext()); /* S */
-    std::unique_ptr<llvm::TargetMachine> llvm_target_machine (llvm::EngineBuilder().selectTarget()); /* TM */
-    llvm::DataLayout llvm_data_layout (llvm_target_machine->createDataLayout());
 
-    // Set up ORC JIT. Can be used for many modules.
-    typedef llvm::orc::ObjectLinkingLayer<> ObjLayerT;
-    typedef llvm::orc::IRCompileLayer<ObjLayerT> CompileLayerT;
-    // typedef llvm::orc::CompileLayerT::ModuleSetHandleT ModuleHandleT;
-    ObjLayerT orc_objlayer;
-    CompileLayerT orc_irlayer (orc_objlayer, llvm::orc::SimpleCompiler(*llvm_target_machine));
 
     std::cout << "did setup\n";
 
-    // Create a module. We can put as many functions in here as we want,
-    // but we JIT it all at once and then we don't add to it again.
-    std::unique_ptr<llvm::Module> llvm_module (new llvm::Module (make_unique_name("jit_module_"),
-                                                                 *llvm_context));
+    jit.new_module ();
+    llvm::Function *func = jit.make_function ("myadd");
 
-    // Create a function. (Empty for now)
-    llvm::IntegerType *inttype = llvm::Type::getInt32Ty (*llvm_context);
-    llvm::Type *params[] = { inttype, inttype };
-    llvm::FunctionType *functype = llvm::FunctionType::get (inttype, params, false/*varargs*/);
-    llvm::Constant *func_const = llvm_module->getOrInsertFunction ("myadd", functype);
-    llvm::Function *func = llvm::cast<llvm::Function>(func_const);
-    ASSERT (func_const);
+    jit.new_basic_block ();
 
-    // Fill out the code for the function: make an IR Builder, create a
-    // basic block for the function, add instructions.
-    llvm::IRBuilder<> llvm_irbuilder (*llvm_context);
-    llvm::BasicBlock *block = llvm::BasicBlock::Create (*llvm_context, make_unique_name("block_"),
-                                                        func);
-    llvm_irbuilder.SetInsertPoint (block);
-    llvm::Value *p0 = current_function_arg (func, 0);
-    llvm::Value *p1 = current_function_arg (func, 1);
-    llvm::Value *r = llvm_irbuilder.CreateAdd (p0, p1);
-    llvm_irbuilder.CreateRet (r);
+    llvm::Value *p0 = jit.current_function_arg (0);
+    llvm::Value *p1 = jit.current_function_arg (1);
+    llvm::Value *r = jit.builder->CreateAdd (p0, p1);
+    jit.builder->CreateRet (r);
 
     std::cout << "Created function\n";
 
-    // Create JIT, which is an ExecutionEngine
+#if 0
+    // addModule:
+    std::vector<std::unique_ptr> modules_to_compile;
+    modules_to_compile.push_back (std::move(llvm_module));
+    auto Resolver = llvm::orc::createLambdaResolver(
+                      [&](const std::string &Name) {
+                        // if (auto Sym = findSymbol(Name))
+                        if (auto Sym = orc_compilelayer.findSymbol(Name, true))
+                          return llvm::RuntimeDyld::SymbolInfo(Sym.getAddress(),
+                                                         Sym.getFlags());
+                        return llvm::RuntimeDyld::SymbolInfo(nullptr);
+                      },
+                      [](const std::string &S) { return nullptr; }
+                    );
+    ModuleHandleT addedModule =
+         orc_compilelayer.addModuleSet(modules_to_compile,
+                                  llvm::make_unique<llvm::SectionMemoryManager>(),
+                                  std::move(Resolver));
 
-    // MCJIT?
-    std::string engine_errors;
-    llvm::EngineBuilder engine_builder (std::move(llvm_module));
-    engine_builder.setEngineKind (llvm::EngineKind::JIT)
-                  .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
-                  .setErrorStr (&engine_errors);
-    std::unique_ptr<llvm::ExecutionEngine> llvm_exec (engine_builder.create());
-
-    llvm_exec->finalizeObject ();   // Necessary?
+    auto ExprSymbol = /*findSymbol(...)*/
+         orc_compilelayer.findSymbol (mangle ("myadd"));
+#else
+    jit.module_done ();
     typedef int (*IntFuncOfTwoInts)(int,int);
-    IntFuncOfTwoInts callable_func = (IntFuncOfTwoInts) llvm_exec->getPointerToFunction (func);
+    IntFuncOfTwoInts callable_func = (IntFuncOfTwoInts) jit.get_compiled_function (func);
+#endif
 
     std::cout << "Generated code?\n";
 
