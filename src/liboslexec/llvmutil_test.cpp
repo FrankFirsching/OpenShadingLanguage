@@ -45,6 +45,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Mangler.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/Support/TargetSelect.h>
@@ -59,6 +60,17 @@ make_unique_name (OIIO::string_view prefix = "___")
     int c = counter++;
     return OIIO::Strutil::format ("%s%d", prefix, c);
 }
+
+
+template <typename T>
+static std::vector<T> singletonSet (T t)
+{
+    std::vector<T> Vec;
+    Vec.push_back(std::move(t));
+    return Vec;
+}
+
+#define USE_ORC 1
 
 
 class SimpleJIT {
@@ -129,20 +141,74 @@ public:
         return llvm::cast<llvm::Value>(arg_it);
     }
 
+    std::string mangle (const std::string &name) {
+        std::string MangledName;
+        llvm::raw_string_ostream MangledNameStream (MangledName);
+        llvm::Mangler::getNameWithPrefix (MangledNameStream, name, *llvm_data_layout);
+        return MangledName;
+    }
+
+    ModuleHandleT addModule (std::unique_ptr<llvm::Module> M) {
+        // We need a memory manager to allocate memory and resolve symbols
+        // for this new module. Create one that resolves symbols by looking
+        // back into the JIT. (Stolen from LLVM Kaleidescope example.)
+        auto Resolver = llvm::orc::createLambdaResolver(
+                          [&](const std::string &Name) {
+                            if (auto Sym = findSymbol(Name))
+                              return llvm::RuntimeDyld::SymbolInfo(Sym.getAddress(),
+                                                             Sym.getFlags());
+                            return llvm::RuntimeDyld::SymbolInfo(nullptr);
+                          },
+                          [](const std::string &S) { return nullptr; }
+                        );
+        // std::vector<std::unique_ptr<llvm::Module>> moduleset;// { std::move(M) };
+        // moduleset.push_back (std::move(M));
+        return orc_compilelayer->addModuleSet (singletonSet(std::move(M)),
+                                               llvm::make_unique<llvm::SectionMemoryManager>(),
+                                               std::move(Resolver));
+    }
+
+    void removeModule (ModuleHandleT H) {
+        orc_compilelayer->removeModuleSet(H);
+    }
+
+    llvm::orc::JITSymbol findSymbol (const std::string &name) {
+        return orc_compilelayer->findSymbol (name, true);
+    }
+
+    llvm::orc::JITSymbol findUnmangledSymbol (const std::string &name) {
+        return findSymbol (mangle (name));
+    }
+
     void module_done () {
-        // MCJIT?
-        std::string engine_errors;
-        llvm::EngineBuilder engine_builder (std::move(llvm_module));
-        engine_builder.setEngineKind (llvm::EngineKind::JIT)
-                      .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
-                      .setErrorStr (&engine_errors);
-        llvm_exec.reset (engine_builder.create());
-        llvm_exec->finalizeObject ();   // Necessary?
+        if (use_orc_jit) {
+            /*auto modulehandle =*/ addModule (std::move(llvm_module));
+        } else {
+            std::string engine_errors;
+            llvm::EngineBuilder engine_builder (std::move(llvm_module));
+            engine_builder.setEngineKind (llvm::EngineKind::JIT)
+                          .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
+                          .setErrorStr (&engine_errors);
+            llvm_exec.reset (engine_builder.create());
+            llvm_exec->finalizeObject ();   // Necessary?
+        }
+    }
+
+    void * get_compiled_function (OIIO::string_view name) {
+        if (use_orc_jit) {
+            auto ExprSymbol = findUnmangledSymbol ("myadd");
+            return (void *) ExprSymbol.getAddress ();
+        } else {
+            return (void *) llvm_exec->getFunctionAddress (name);
+        }
     }
 
     void * get_compiled_function (llvm::Function *func) {
         return llvm_exec->getPointerToFunction (func);
     }
+
+    void orc_jit (bool enable) { use_orc_jit = enable; }
+    bool orc_jit () const { return use_orc_jit; }
 
     std::unique_ptr<llvm::LLVMContext> llvm_context;
     std::unique_ptr<llvm::TargetMachine> llvm_target_machine;
@@ -155,6 +221,7 @@ public:
     llvm::Function *current_func = NULL;
     llvm::BasicBlock *current_block = NULL;
     std::unique_ptr<llvm::ExecutionEngine> llvm_exec;
+    bool use_orc_jit = true;
 };
 
 
@@ -169,10 +236,10 @@ main (int argc, char *argv[])
 
 
 
-    std::cout << "did setup\n";
+    std::cout << "did setup, orc=" << jit.orc_jit() << "\n";
 
     jit.new_module ();
-    llvm::Function *func = jit.make_function ("myadd");
+    /*llvm::Function *func =*/ jit.make_function ("myadd");
 
     jit.new_basic_block ();
 
@@ -183,32 +250,9 @@ main (int argc, char *argv[])
 
     std::cout << "Created function\n";
 
-#if 0
-    // addModule:
-    std::vector<std::unique_ptr> modules_to_compile;
-    modules_to_compile.push_back (std::move(llvm_module));
-    auto Resolver = llvm::orc::createLambdaResolver(
-                      [&](const std::string &Name) {
-                        // if (auto Sym = findSymbol(Name))
-                        if (auto Sym = orc_compilelayer.findSymbol(Name, true))
-                          return llvm::RuntimeDyld::SymbolInfo(Sym.getAddress(),
-                                                         Sym.getFlags());
-                        return llvm::RuntimeDyld::SymbolInfo(nullptr);
-                      },
-                      [](const std::string &S) { return nullptr; }
-                    );
-    ModuleHandleT addedModule =
-         orc_compilelayer.addModuleSet(modules_to_compile,
-                                  llvm::make_unique<llvm::SectionMemoryManager>(),
-                                  std::move(Resolver));
-
-    auto ExprSymbol = /*findSymbol(...)*/
-         orc_compilelayer.findSymbol (mangle ("myadd"));
-#else
     jit.module_done ();
     typedef int (*IntFuncOfTwoInts)(int,int);
-    IntFuncOfTwoInts callable_func = (IntFuncOfTwoInts) jit.get_compiled_function (func);
-#endif
+    IntFuncOfTwoInts callable_func = (IntFuncOfTwoInts) jit.get_compiled_function ("myadd");
 
     std::cout << "Generated code?\n";
 
