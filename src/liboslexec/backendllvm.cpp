@@ -677,8 +677,8 @@ BackendLLVM::userdata_initialized_ref (int userdata_index)
 
 llvm::Value *
 BackendLLVM::llvm_call_function (const char *name, 
-                                      const Symbol **symargs, int nargs,
-                                      bool deriv_ptrs)
+                                 const Symbol **symargs, int nargs,
+                                 bool deriv_ptrs)
 {
     std::vector<llvm::Value *> valargs;
     valargs.resize ((size_t)nargs);
@@ -692,8 +692,7 @@ BackendLLVM::llvm_call_function (const char *name,
         else
             valargs[i] = llvm_load_value (s);
     }
-    return ll.call_function (name, (valargs.size())? &valargs[0]: NULL,
-                             (int)valargs.size());
+    return ll.call_function (name, valargs);
 }
 
 

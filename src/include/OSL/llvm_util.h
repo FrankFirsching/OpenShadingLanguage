@@ -95,11 +95,11 @@ public:
                             llvm::IRBuilderDefaultInserter<true> > IRBuilder;
 
     /// Set debug level
-    void debug (int d) { m_debug = d; }
-    int debug () const { return m_debug; }
+    void debug (int d);
+    int debug () const;
 
     /// Return a reference to the current context.
-    llvm::LLVMContext &context () const { return *m_llvm_context; }
+    llvm::LLVMContext &context () const;
 
     /// Return a pointer to the current module.  Make a new one if
     /// necessary.
@@ -137,10 +137,10 @@ public:
 
     /// Set up a new current function that subsequent basic blocks will
     /// be added to.
-    void current_function (llvm::Function *func) { m_current_function = func; }
+    void current_function (llvm::Function *func);
 
     /// Return a ptr to the current function we're generating.
-    llvm::Function *current_function () const { return m_current_function; }
+    llvm::Function *current_function () const;
 
     /// Return the value ptr for the a-th argument of the current function.
     llvm::Value *current_function_arg (int a);
@@ -156,11 +156,7 @@ public:
 
     /// Return the current IR builder, create a new one (for the current
     /// function) if necessary.
-    IRBuilder &builder () {
-        if (! m_builder)
-            new_builder ();
-        return *m_builder;
-    }
+    IRBuilder &builder ();
 
     /// Create a new JITing ExecutionEngine and make it the current one.
     /// Return a pointer to the new engine.  If err is not NULL, put any
@@ -169,15 +165,11 @@ public:
 
     /// Return a pointer to the current ExecutionEngine.  Create a JITing
     /// ExecutionEngine if one isn't already set up.
-    llvm::ExecutionEngine *execengine () {
-        if (! m_llvm_exec)
-            make_jit_execengine();
-        return m_llvm_exec;
-    }
+    llvm::ExecutionEngine *execengine ();
 
     /// Replace the ExecutionEngine (pass NULL to simply delete the
     /// current one).
-    void execengine (llvm::ExecutionEngine *exec);
+    void execengine (llvm::ExecutionEngine *exec) { /* FIXME */ }
 
     /// Change symbols in the module that are marked as having external
     /// linkage to an alternate linkage that allows them to be discarded if
@@ -234,24 +226,24 @@ public:
     llvm::BasicBlock *loop_after_block () const;
 
 
-    llvm::Type *type_float() const { return m_llvm_type_float; }
-    llvm::Type *type_int() const { return m_llvm_type_int; }
-    llvm::Type *type_addrint() const { return m_llvm_type_addrint; }
-    llvm::Type *type_bool() const { return m_llvm_type_bool; }
-    llvm::Type *type_char() const { return m_llvm_type_char; }
-    llvm::Type *type_longlong() const { return m_llvm_type_longlong; }
-    llvm::Type *type_void() const { return m_llvm_type_void; }
-    llvm::Type *type_triple() const { return m_llvm_type_triple; }
-    llvm::Type *type_matrix() const { return m_llvm_type_matrix; }
-    llvm::Type *type_typedesc() const { return m_llvm_type_longlong; }
-    llvm::PointerType *type_void_ptr() const { return m_llvm_type_void_ptr; }
-    llvm::PointerType *type_string() { return m_llvm_type_char_ptr; }
-    llvm::PointerType *type_ustring_ptr() const { return m_llvm_type_ustring_ptr; }
-    llvm::PointerType *type_char_ptr() const { return m_llvm_type_char_ptr; }
-    llvm::PointerType *type_int_ptr() const { return m_llvm_type_int_ptr; }
-    llvm::PointerType *type_float_ptr() const { return m_llvm_type_float_ptr; }
-    llvm::PointerType *type_triple_ptr() const { return m_llvm_type_triple_ptr; }
-    llvm::PointerType *type_matrix_ptr() const { return m_llvm_type_matrix_ptr; }
+    llvm::Type *type_float() const;
+    llvm::Type *type_int() const;
+    llvm::Type *type_addrint() const;
+    llvm::Type *type_bool() const;
+    llvm::Type *type_char() const;
+    llvm::Type *type_longlong() const;
+    llvm::Type *type_void() const;
+    llvm::Type *type_triple() const;
+    llvm::Type *type_matrix() const;
+    llvm::Type *type_typedesc() const;
+    llvm::PointerType *type_void_ptr() const;
+    llvm::PointerType *type_string() const;
+    llvm::PointerType *type_ustring_ptr() const;
+    llvm::PointerType *type_char_ptr() const;
+    llvm::PointerType *type_int_ptr() const;
+    llvm::PointerType *type_float_ptr() const;
+    llvm::PointerType *type_triple_ptr() const;
+    llvm::PointerType *type_matrix_ptr() const;
 
     /// Generate the appropriate llvm type definition for a TypeDesc
     /// (this is the actual type, for example when we allocate it).
@@ -370,35 +362,32 @@ public:
     /// arg list.  Return an llvm::Value* corresponding to the return
     /// value of the function, if any.
     llvm::Value *call_function (llvm::Value *func,
-                                llvm::Value **args, int nargs);
+                                OIIO::array_view<llvm::Value *> args);
     /// Generate code for a call to the named function with the given arg
     /// list.  Return an llvm::Value* corresponding to the return value of
     /// the function, if any.
-    llvm::Value *call_function (const char *name,
-                                llvm::Value **args, int nargs);
-    template<size_t N>
-    llvm::Value* call_function (const char *name, llvm::Value* (&args)[N]) {
-        return call_function (name, &args[0], int(N));
-    }
+    llvm::Value *call_function (string_view name,
+                                OIIO::array_view<llvm::Value *> args);
 
-    llvm::Value *call_function (const char *name, llvm::Value *arg0) {
-        return call_function (name, &arg0, 1);
+    llvm::Value *call_function (string_view name, llvm::Value *arg0) {
+        llvm::Value *args[1] = { arg0 };
+        return call_function (name, args);
     }
-    llvm::Value *call_function (const char *name, llvm::Value *arg0,
+    llvm::Value *call_function (string_view name, llvm::Value *arg0,
                                 llvm::Value *arg1) {
         llvm::Value *args[2] = { arg0, arg1 };
-        return call_function (name, args, 2);
+        return call_function (name, args);
     }
-    llvm::Value *call_function (const char *name, llvm::Value *arg0,
+    llvm::Value *call_function (string_view name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2) {
         llvm::Value *args[3] = { arg0, arg1, arg2 };
-        return call_function (name, args, 3);
+        return call_function (name, args);
     }
-    llvm::Value *call_function (const char *name, llvm::Value *arg0,
+    llvm::Value *call_function (string_view name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2,
                                 llvm::Value *arg3) {
         llvm::Value *args[4] = { arg0, arg1, arg2, arg3 };
-        return call_function (name, args, 4);
+        return call_function (name, args);
     }
 
     /// Mark the function call (which MUST be the value returned by a
@@ -510,50 +499,9 @@ public:
     static size_t total_jit_memory_held ();
 
 private:
-    /// Return a pointer to the JIT memory manager.
-    llvm::JITMemoryManager *jitmm () const {
-        return (llvm::JITMemoryManager *)m_llvm_jitmm;
-    }
-
-    void SetupLLVM ();
-    void setup_llvm_datatype_aliases (llvm::LLVMContext *context);
-
     class Impl;
     std::unique_ptr<Impl> m_impl;
     Impl *impl() { return m_impl.get(); }
-
-    int m_debug;
-    PerThreadInfo *m_thread;
-    llvm::LLVMContext *m_llvm_context;
-    // std::unique_ptr<llvm::Module> m_llvm_module;
-    // std::unique_ptr<llvm::TargetMachine> m_target_machine;
-    IRBuilder *m_builder;
-    OSL_Dummy_JITMemoryManager *m_llvm_jitmm;
-    llvm::Function *m_current_function;
-    llvm::legacy::PassManager *m_llvm_module_passes;
-    llvm::legacy::FunctionPassManager *m_llvm_func_passes;
-    llvm::ExecutionEngine *m_llvm_exec;
-    std::vector<llvm::BasicBlock *> m_return_block;     // stack for func call
-    std::vector<llvm::BasicBlock *> m_loop_after_block; // stack for break
-    std::vector<llvm::BasicBlock *> m_loop_step_block;  // stack for continue
-
-    llvm::Type *m_llvm_type_float;
-    llvm::Type *m_llvm_type_int;
-    llvm::Type *m_llvm_type_addrint;
-    llvm::Type *m_llvm_type_bool;
-    llvm::Type *m_llvm_type_char;
-    llvm::Type *m_llvm_type_longlong;
-    llvm::Type *m_llvm_type_void;
-    llvm::Type *m_llvm_type_triple;
-    llvm::Type *m_llvm_type_matrix;
-    llvm::PointerType *m_llvm_type_void_ptr;
-    llvm::PointerType *m_llvm_type_ustring_ptr;
-    llvm::PointerType *m_llvm_type_char_ptr;
-    llvm::PointerType *m_llvm_type_int_ptr;
-    llvm::PointerType *m_llvm_type_float_ptr;
-    llvm::PointerType *m_llvm_type_triple_ptr;
-    llvm::PointerType *m_llvm_type_matrix_ptr;
-
 };
 
 
