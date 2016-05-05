@@ -37,9 +37,112 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #if 1
 
+#include <llvm/ExecutionEngine/ExecutionEngine.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
+#include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
+#include <llvm/IR/DataLayout.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+
+#include <OpenImageIO/thread.h>
+
+std::string
+make_unique_name (OIIO::string_view prefix = "___")
+{
+    static OIIO::atomic_int counter (0);
+    int c = counter++;
+    return OIIO::Strutil::format ("%s%d", prefix, c);
+}
+
+
+llvm::Value *
+current_function_arg (llvm::Function *func, int a)
+{
+    llvm::Function::arg_iterator arg_it = func->arg_begin();
+    while (a-- > 0)
+        ++arg_it;
+    return llvm::cast<llvm::Value>(arg_it);
+}
+
+
+
 int
 main (int argc, char *argv[])
 {
+    {
+    std::cout << "running llvmutil_test...\n";
+
+    // Initialize LLVM generally
+    llvm::InitializeAllTargets();
+    // llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
+    // llvm::InitializeAllDisassemblers();
+
+    // Grab an LLVM context, target machine, and data layout. These can be
+    // reused for many modules.
+    std::unique_ptr<llvm::LLVMContext> llvm_context (new llvm::LLVMContext()); /* S */
+    std::unique_ptr<llvm::TargetMachine> llvm_target_machine (llvm::EngineBuilder().selectTarget()); /* TM */
+    llvm::DataLayout llvm_data_layout (llvm_target_machine->createDataLayout());
+
+    // Set up ORC JIT. Can be used for many modules.
+    typedef llvm::orc::ObjectLinkingLayer<> ObjLayerT;
+    typedef llvm::orc::IRCompileLayer<ObjLayerT> CompileLayerT;
+    // typedef llvm::orc::CompileLayerT::ModuleSetHandleT ModuleHandleT;
+    ObjLayerT orc_objlayer;
+    CompileLayerT orc_irlayer (orc_objlayer, llvm::orc::SimpleCompiler(*llvm_target_machine));
+
+    std::cout << "did setup\n";
+
+    // Create a module. We can put as many functions in here as we want,
+    // but we JIT it all at once and then we don't add to it again.
+    std::unique_ptr<llvm::Module> llvm_module (new llvm::Module (make_unique_name("jit_module_"),
+                                                                 *llvm_context));
+
+    // Create a function. (Empty for now)
+    llvm::IntegerType *inttype = llvm::Type::getInt32Ty (*llvm_context);
+    llvm::Type *params[] = { inttype, inttype };
+    llvm::FunctionType *functype = llvm::FunctionType::get (inttype, params, false/*varargs*/);
+    llvm::Constant *func_const = llvm_module->getOrInsertFunction ("myadd", functype);
+    llvm::Function *func = llvm::cast<llvm::Function>(func_const);
+    ASSERT (func_const);
+
+    // Fill out the code for the function: make an IR Builder, create a
+    // basic block for the function, add instructions.
+    llvm::IRBuilder<> llvm_irbuilder (*llvm_context);
+    llvm::BasicBlock *block = llvm::BasicBlock::Create (*llvm_context, make_unique_name("block_"),
+                                                        func);
+    llvm_irbuilder.SetInsertPoint (block);
+    llvm::Value *p0 = current_function_arg (func, 0);
+    llvm::Value *p1 = current_function_arg (func, 1);
+    llvm::Value *r = llvm_irbuilder.CreateAdd (p0, p1);
+    llvm_irbuilder.CreateRet (r);
+
+    std::cout << "Created function\n";
+
+    // Create JIT, which is an ExecutionEngine
+
+    // MCJIT?
+    std::string engine_errors;
+    llvm::EngineBuilder engine_builder (std::move(llvm_module));
+    engine_builder.setEngineKind (llvm::EngineKind::JIT)
+                  .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
+                  .setErrorStr (&engine_errors);
+    std::unique_ptr<llvm::ExecutionEngine> llvm_exec (engine_builder.create());
+
+    llvm_exec->finalizeObject ();   // Necessary?
+    typedef int (*IntFuncOfTwoInts)(int,int);
+    IntFuncOfTwoInts callable_func = (IntFuncOfTwoInts) llvm_exec->getPointerToFunction (func);
+
+    std::cout << "Generated code?\n";
+
+    std::cout << "Result 40+2 = " << callable_func(40, 2) << "\n";
+
 #if 0
     getargs (argc, argv);
 
@@ -58,6 +161,10 @@ main (int argc, char *argv[])
                   << OIIO::Strutil::memformat(OIIO::Sysutil::memory_used()) << "\n";
     }
 #endif
+
+    }
+    std::cout << "did teardown\n";
+
     return 0;
 }
 

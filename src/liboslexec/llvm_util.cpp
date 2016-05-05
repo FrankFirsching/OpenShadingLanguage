@@ -621,7 +621,6 @@ LLVM_Util::make_function (const std::string &name, bool fastcall,
 llvm::Value *
 LLVM_Util::current_function_arg (int a)
 {
-#
     llvm::Function::arg_iterator arg_it = current_function()->arg_begin();
     for (int i = 0;  i < a;  ++i)
         ++arg_it;
