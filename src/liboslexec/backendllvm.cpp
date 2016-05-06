@@ -85,13 +85,15 @@ check_cwd (ShadingSystemImpl &shadingsys)
 
 
 BackendLLVM::BackendLLVM (ShadingSystemImpl &shadingsys,
-                          ShaderGroup &group, ShadingContext *ctx)
-    : OSOProcessorBase (shadingsys, group, ctx),
-      ll(llvm_debug()),
+                          ShaderGroup &group, ShadingContext *ctx,
+                          LLVM_Util &ll)
+    : OSOProcessorBase (shadingsys, group, ctx), ll(ll),
       m_stat_total_llvm_time(0), m_stat_llvm_setup_time(0),
       m_stat_llvm_irgen_time(0), m_stat_llvm_opt_time(0),
       m_stat_llvm_jit_time(0)
 {
+    ll.debug (llvm_debug());
+    ll.orc_jit (shadingsys.m_llvm_orcjit);
 #ifdef OSL_SPI
     // Temporary (I hope) check to diagnose an intermittent failure of
     // getcwd inside LLVM. Oy.

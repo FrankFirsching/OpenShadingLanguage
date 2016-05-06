@@ -120,6 +120,7 @@ using OIIO::TypeDesc;
 using OIIO::ustring;
 using OIIO::ustringHash;
 using OIIO::string_view;
+using OIIO::array_view;
 
 // Sort out smart pointers
 #if OSL_CPLUSPLUS_VERSION >= 11

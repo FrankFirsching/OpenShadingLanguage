@@ -69,6 +69,8 @@ namespace Strutil = OIIO::Strutil;
 
 OSL_NAMESPACE_ENTER
 
+class LLVM_Util;   // forward declaration of the name
+
 
 
 struct PerThreadInfo
@@ -752,6 +754,7 @@ private:
     bool m_optimize_nondebug;             ///< Fully optimize non-debug!
     int m_opt_passes;                     ///< Opt passes per layer
     int m_llvm_optimize;                  ///< OSL optimization strategy
+    bool m_llvm_orcjit;                   ///< Use ORC JIT
     int m_debug;                          ///< Debugging output
     int m_llvm_debug;                     ///< More LLVM debugging output
     int m_llvm_debug_layers;              ///< Add layer enter/exit printfs
@@ -790,6 +793,10 @@ private:
     ShaderGroupRef m_curgroup;            ///< Current shading attribute state
     mutable mutex m_mutex;                ///< Thread safety
     mutable boost::thread_specific_ptr<PerThreadInfo> m_perthread_info;
+
+    // LLVM stuff
+    std::unique_ptr<LLVM_Util> m_llvmutil;
+    mutex m_llvmutil_mutex;
 
     // Stats
     atomic_int m_stat_shaders_loaded;     ///< Stat: shaders loaded

@@ -649,7 +649,7 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_opt_seed_bblock_aliases(true),
       m_optimize_nondebug(false),
       m_opt_passes(10),
-      m_llvm_optimize(0),
+      m_llvm_optimize(0), m_llvm_orcjit(false),
       m_debug(0), m_llvm_debug(0), m_llvm_debug_layers(0),
       m_commonspace_synonym("world"),
       m_colorspace("Rec709"),
@@ -1065,6 +1065,7 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
     ATTR_SET ("opt_passes", int, m_opt_passes);
     ATTR_SET ("optimize_nondebug", int, m_optimize_nondebug);
     ATTR_SET ("llvm_optimize", int, m_llvm_optimize);
+    ATTR_SET ("llvm_orcjit", int, m_llvm_orcjit);
     ATTR_SET ("llvm_debug", int, m_llvm_debug);
     ATTR_SET ("llvm_debug_layers", int, m_llvm_debug_layers);
     ATTR_SET ("strict_messages", int, m_strict_messages);
@@ -1172,6 +1173,7 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     ATTR_DECODE ("opt_passes", int, m_opt_passes);
     ATTR_DECODE ("optimize_nondebug", int, m_optimize_nondebug);
     ATTR_DECODE ("llvm_optimize", int, m_llvm_optimize);
+    ATTR_DECODE ("llvm_orcjit", int, m_llvm_orcjit);
     ATTR_DECODE ("debug", int, m_debug);
     ATTR_DECODE ("llvm_debug", int, m_llvm_debug);
     ATTR_DECODE ("llvm_debug_layers", int, m_llvm_debug_layers);
@@ -1582,6 +1584,7 @@ ShadingSystemImpl::getstats (int level) const
 #define STROPT(name) if (m_##name.size()) opt += Strutil::format(#name "=\"%s\" ", m_##name)
     INTOPT (optimize);
     INTOPT (llvm_optimize);
+    INTOPT (llvm_orcjit);
     INTOPT (debug);
     INTOPT (profile);
     INTOPT (llvm_debug);
@@ -2662,8 +2665,24 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
         group.m_attribute_scopes.push_back (f.scope);
     }
 
-    BackendLLVM lljitter (*this, group, ctx);
-    lljitter.run ();
+    {
+        // FIXME -- for now, have only one LLVM_Util for the whole
+        // ShadingSystem, guard it with a mutex. Later, we should make a
+        // pool of them so multiple threads can JIT simultaneously.
+        lock_guard lock (m_llvmutil_mutex);
+        if (! m_llvmutil)
+            m_llvmutil.reset (new LLVM_Util);
+        BackendLLVM lljitter (*this, group, ctx, *m_llvmutil);
+        lljitter.run ();
+
+        m_stat_total_llvm_time += lljitter.m_stat_total_llvm_time;
+        m_stat_llvm_setup_time += lljitter.m_stat_llvm_setup_time;
+        m_stat_llvm_irgen_time += lljitter.m_stat_llvm_irgen_time;
+        m_stat_llvm_opt_time += lljitter.m_stat_llvm_opt_time;
+        m_stat_llvm_jit_time += lljitter.m_stat_llvm_jit_time;
+        m_stat_max_llvm_local_mem = std::max (m_stat_max_llvm_local_mem,
+                                              lljitter.m_llvm_local_mem);
+    }
 
     group_post_jit_cleanup (group);
 
@@ -2674,13 +2693,6 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
     m_stat_optimization_time += timer();
     m_stat_opt_locking_time += locking_time + rop.m_stat_opt_locking_time;
     m_stat_specialization_time += rop.m_stat_specialization_time;
-    m_stat_total_llvm_time += lljitter.m_stat_total_llvm_time;
-    m_stat_llvm_setup_time += lljitter.m_stat_llvm_setup_time;
-    m_stat_llvm_irgen_time += lljitter.m_stat_llvm_irgen_time;
-    m_stat_llvm_opt_time += lljitter.m_stat_llvm_opt_time;
-    m_stat_llvm_jit_time += lljitter.m_stat_llvm_jit_time;
-    m_stat_max_llvm_local_mem = std::max (m_stat_max_llvm_local_mem,
-                                          lljitter.m_llvm_local_mem);
     m_stat_groups_compiled += 1;
     m_stat_instances_compiled += group.nlayers();
     m_groups_to_compile_count -= 1;

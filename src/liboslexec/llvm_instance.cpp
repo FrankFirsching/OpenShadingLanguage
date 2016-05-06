@@ -167,8 +167,11 @@ void *
 helper_function_lookup (const std::string &name)
 {
     HelperFuncMap::const_iterator i = llvm_helper_function_map.find (name);
-    if (i == llvm_helper_function_map.end())
+    if (i == llvm_helper_function_map.end()) {
+        std::cout << "Helper function lookup '" << name << "' : not found\n";
         return NULL;
+    }
+    std::cout << "Helper function lookup '" << name << "' : " << (void*)i->second.function << "\n";
     return (void *) i->second.function;
 }
 
@@ -672,18 +675,14 @@ BackendLLVM::build_llvm_init ()
     // Make a group init function: void group_init(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
     std::string unique_name = Strutil::format ("group_%d_init", group().id());
-    ll.current_function (
-           ll.make_function (unique_name, false,
-                             ll.type_void(), // return type
-                             llvm_type_sg_ptr(), llvm_type_groupdata_ptr()));
+    ll.make_function (unique_name, false,
+                      ll.type_void(), // return type
+                      llvm_type_sg_ptr(), llvm_type_groupdata_ptr());
 
     // Get shader globals and groupdata pointers
     m_llvm_shaderglobals_ptr = ll.current_function_arg(0); //arg_it++;
     m_llvm_groupdata_ptr = ll.current_function_arg(1); //arg_it++;
 
-    // Set up a new IR builder
-    llvm::BasicBlock *entry_bb = ll.new_basic_block (unique_name);
-    ll.new_builder (entry_bb);
 #if 0 /* helpful for debugging */
     if (llvm_debug()) {
         llvm_gen_debug_printf (Strutil::format("\n\n\n\nGROUP! %s",group().name()));
@@ -734,8 +733,6 @@ BackendLLVM::build_llvm_init ()
                   << " after llvm  = " 
                   << ll.bitcode_string(ll.current_function()) << "\n";
 
-    ll.end_builder();  // clear the builder
-
     return ll.current_function();
 }
 
@@ -746,24 +743,18 @@ BackendLLVM::build_llvm_instance (bool groupentry)
 {
     // Make a layer function: void layer_func(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
-    std::string unique_layer_name = Strutil::format ("%s_%d", inst()->layername(), inst()->id());
 
     bool is_entry_layer = group().is_entry_layer(layer());
-    ll.current_function (
-           ll.make_function (unique_layer_name,
-                             !is_entry_layer, // fastcall for non-entry layer functions
-                             ll.type_void(), // return type
-                             llvm_type_sg_ptr(), llvm_type_groupdata_ptr()));
+    ll.make_function (layer_function_name(inst()),
+                      !is_entry_layer, // fastcall for non-entry layer functions
+                      ll.type_void(), // return type
+                      llvm_type_sg_ptr(), llvm_type_groupdata_ptr());
 
     // Get shader globals and groupdata pointers
     m_llvm_shaderglobals_ptr = ll.current_function_arg(0); //arg_it++;
     m_llvm_groupdata_ptr = ll.current_function_arg(1); //arg_it++;
 
-    llvm::BasicBlock *entry_bb = ll.new_basic_block (unique_layer_name);
     m_exit_instance_block = NULL;
-
-    // Set up a new IR builder
-    ll.new_builder (entry_bb);
 
     llvm::Value *layerfield = layer_run_ref(layer_remap(layer()));
     if (is_entry_layer && ! group().is_last_layer(layer())) {
@@ -909,11 +900,9 @@ BackendLLVM::build_llvm_instance (bool groupentry)
     ll.op_return();
 
     if (llvm_debug())
-        std::cout << "layer_func (" << unique_layer_name << ") "<< this->layer() 
+        std::cout << "layer_func (" << layer_function_name(inst()) << ") "<< this->layer() 
                   << "/" << group().nlayers() << " after llvm  = " 
                   << ll.bitcode_string(ll.current_function()) << "\n";
-
-    ll.end_builder();  // clear the builder
 
     return ll.current_function();
 }
@@ -937,7 +926,7 @@ BackendLLVM::initialize_llvm_group ()
     for (HelperFuncMap::iterator i = llvm_helper_function_map.begin(),
          e = llvm_helper_function_map.end(); i != e; ++i) {
         const char *funcname = i->first.c_str();
-        bool varargs = false;
+        LLVM_Util::HasVarArgs varargs = LLVM_Util::NoVarArgs;
         const char *types = i->second.argtypes;
         int advance;
         TypeSpec rettype = OSLCompilerImpl::type_from_code (types, &advance);
@@ -947,7 +936,7 @@ BackendLLVM::initialize_llvm_group ()
             TypeSpec t = OSLCompilerImpl::type_from_code (types, &advance);
             if (t.simpletype().basetype == TypeDesc::UNKNOWN) {
                 if (*types == '*')
-                    varargs = true;
+                    varargs = LLVM_Util::VarArgs;
                 else
                     ASSERT (0);
             } else {
@@ -955,7 +944,8 @@ BackendLLVM::initialize_llvm_group ()
             }
             types += advance;
         }
-        ll.make_function (funcname, false, llvm_type(rettype), params, varargs);
+        ll.declare_extern_function (funcname, llvm_type(rettype), params,
+                                    varargs);
     }
 
     // Needed for closure setup
@@ -987,26 +977,25 @@ BackendLLVM::run ()
     OIIO::spin_lock lock (mutex);
 #endif
 
-#if 0 /*FIXME!!!*/
-
 #ifdef OSL_LLVM_NO_BITCODE
-    ll.module (ll.new_module ("llvm_ops"));
+    ll.new_module ("llvm_ops");
 #else
-    ll.module (ll.module_from_bitcode (osl_llvm_compiled_ops_block,
-                                       osl_llvm_compiled_ops_size,
-                                       "llvm_ops", &err));
+    string_view seed (osl_llvm_compiled_ops_block, osl_llvm_compiled_ops_size);
+    ll.module_from_bitcode (seed, "llvm_ops", &err);
+    // ll.new_module ("llvm_ops");
     if (err.length())
-        shadingcontext()->error ("ParseBitcodeFile returned '%s'\n", err.c_str());
+        shadingcontext()->error ("ParseBitcodeFile returned '%s'\n", err);
     ASSERT (ll.module());
 #endif
-#endif
     
+#if 0
     // Create the ExecutionEngine
     if (! ll.make_jit_execengine (&err)) {
-        shadingcontext()->error ("Failed to create engine: %s\n", err.c_str());
+        shadingcontext()->error ("Failed to create engine: %s\n", err);
         ASSERT (0);
         return;
     }
+#endif
 
     // End of mutex lock, for the OSL_LLVM_NO_BITCODE case
     }
@@ -1098,18 +1087,26 @@ BackendLLVM::run ()
         ll.write_bitcode_file (name.c_str());
     }
 
+    ll.module_done ();
+
     // Force the JIT to happen now and retrieve the JITed function pointers
     // for the initialization and all public entry points.
-    group().llvm_compiled_init ((RunLLVMGroupFunc) ll.getPointerToFunction(init_func));
+    group().llvm_compiled_init ((RunLLVMGroupFunc) ll.get_compiled_function(entry_function_names[0]));
     for (int layer = 0; layer < nlayers; ++layer) {
         llvm::Function* f = funcs[layer];
-        if (f && group().is_entry_layer (layer))
-            group().llvm_compiled_layer (layer, (RunLLVMGroupFunc) ll.getPointerToFunction(f));
+        if (f && group().is_entry_layer (layer)) {
+            string_view name (layer_function_name(group()[layer]));
+            ASSERT (ll.get_compiled_function(name));
+            group().llvm_compiled_layer (layer, (RunLLVMGroupFunc) ll.get_compiled_function(name));
+        }
     }
     if (group().num_entry_layers())
         group().llvm_compiled_version (NULL);
-    else
+    else {
+        string_view name (layer_function_name(group()[nlayers-1]));
+        group().llvm_compiled_layer (nlayers-1, (RunLLVMGroupFunc) ll.get_compiled_function(name));
         group().llvm_compiled_version (group().llvm_compiled_layer(nlayers-1));
+    }
 
     // Remove the IR for the group layer functions, we've already JITed it
     // and will never need the IR again.  This saves memory, and also saves
@@ -1123,10 +1120,10 @@ BackendLLVM::run ()
 
     // Free the exec and module to reclaim all the memory.  This definitely
     // saves memory, and has almost no effect on runtime.
-    ll.execengine (NULL);
+//    ll.execengine (NULL);
 
     // N.B. Destroying the EE should have destroyed the module as well.
-    ll.module (NULL);
+//    ll.module (NULL);
 
     m_stat_llvm_jit_time += timer.lap();
 
