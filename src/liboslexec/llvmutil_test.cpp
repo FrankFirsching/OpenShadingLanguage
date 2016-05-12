@@ -131,12 +131,126 @@ test_int_func ()
 }
 
 
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/Bitcode/ReaderWriter.h>
+#include <llvm/ExecutionEngine/ExecutionEngine.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
+#include <llvm/ExecutionEngine/RuntimeDyld.h>
+#include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
+#include <llvm/ExecutionEngine/Orc/LambdaResolver.h>
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
+#include <llvm/IR/DataLayout.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Mangler.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/IPO/PassManagerBuilder.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils/UnifyFunctionExitNodes.h>
+
+template <typename T>
+inline std::vector<T> singletonSet (T t)
+{
+    std::vector<T> Vec;
+    Vec.push_back(std::move(t));
+    return Vec;
+}
 
 
 extern "C" {
-__attribute__ ((visibility ("default"))) 
+// __attribute__ ((visibility ("default")))
 float sqr (float x) { return x*x; }
 }
+
+#if 1
+void
+simple ()
+{
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
+    llvm::LLVMContext Context;
+    std::unique_ptr<llvm::TargetMachine> TM (llvm::EngineBuilder().selectTarget());
+    std::unique_ptr<llvm::DataLayout> DL;
+    DL.reset (new llvm::DataLayout (TM->createDataLayout()));
+    std::unique_ptr<llvm::ExecutionEngine> EE;
+    typedef llvm::orc::ObjectLinkingLayer<> ObjLayerT;
+    typedef llvm::orc::IRCompileLayer<ObjLayerT> CompileLayerT;
+    typedef CompileLayerT::ModuleSetHandleT ModuleHandleT;
+    ObjLayerT Objlayer;
+    CompileLayerT Compilelayer (Objlayer, llvm::orc::SimpleCompiler(*TM));
+    std::unique_ptr<llvm::Module> M (new llvm::Module("module", Context));
+    M->setDataLayout (*DL);
+
+    // Declare stub for external function sqr
+    auto type_float = llvm::Type::getFloatTy (Context);
+    llvm::Type* one_float[] = { type_float };
+    llvm::FunctionType *functype_ff = llvm::FunctionType::get (type_float, one_float, false);
+    llvm::Function::Create (functype_ff, llvm::Function::ExternalLinkage,
+                            "sqr", M.get());
+
+
+    // Create myfunc and generate its IR, which just calls sqr on its argument
+    llvm::Function *myfunc = llvm::Function::Create (functype_ff,
+                                                     llvm::Function::ExternalLinkage,
+                                                     "myfunc", M.get());
+    llvm::IRBuilder<> builder (Context);
+    auto block = llvm::BasicBlock::Create (Context, "", myfunc);
+    builder.SetInsertPoint (block);
+    llvm::Value *a = llvm::cast<llvm::Value>(myfunc->arg_begin());
+    llvm::Value *asq = builder.CreateCall (M->getFunction ("sqr"), a);
+    builder.CreateRet (asq);
+
+    // Set up compilation
+    if (orc) {
+        auto Resolver = llvm::orc::createLambdaResolver(
+            // External lookup functor
+            [&](const std::string &name) {
+                if (auto Sym = Compilelayer.findSymbol(name, true))
+                    return llvm::RuntimeDyld::SymbolInfo(Sym.getAddress(), Sym.getFlags());
+                // If not found as a symbol, look up in current process
+                if (auto Addr = llvm::RTDyldMemoryManager::getSymbolAddressInProcess(name))
+                    return llvm::RuntimeDyld::SymbolInfo(Addr, llvm::JITSymbolFlags::Exported);
+                return llvm::RuntimeDyld::SymbolInfo(nullptr);
+            },
+            // Dylib lookup functor
+            [&](const std::string &name) { return nullptr; }
+        );
+        Compilelayer.addModuleSet (singletonSet(std::move(M)),
+                                          llvm::make_unique<llvm::SectionMemoryManager>(),
+                                          std::move(Resolver));
+    } else {
+        // MCJIT
+        std::string engine_errors;
+        llvm::EngineBuilder engine_builder (std::move(M));
+        engine_builder.setEngineKind (llvm::EngineKind::JIT)
+                      .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
+                      .setErrorStr (&engine_errors);
+        EE.reset (engine_builder.create());
+        EE->finalizeObject ();
+    }
+
+    // Ask for a callable function (will JIT on demand)
+    typedef float (*FuncFloatFloat)(float);
+    FuncFloatFloat my_executable_function = NULL;
+    if (orc) {
+        auto ExprSymbol = Compilelayer.findSymbol ("myfunc", true);
+        my_executable_function = (FuncFloatFloat) ExprSymbol.getAddress ();
+    } else {
+        my_executable_function = (FuncFloatFloat) EE->getFunctionAddress ("myfunc");
+    }
+
+    ASSERT (my_executable_function);
+    printf ("myfunc(42.0f) = %g\n",
+            (*my_executable_function)(42.0f));
+}
+#endif
 
 
 // This demonstrates the use of LLVM_Util to generate the following
@@ -279,8 +393,9 @@ main (int argc, char *argv[])
     getargs (argc, argv);
 
     // Test simple functions
-    test_int_func();
-    test_triple_func();
+    // test_int_func();
+    // test_triple_func();
+    simple ();
 
     if (memtest) {
         OSL::LLVM_Util ll;
