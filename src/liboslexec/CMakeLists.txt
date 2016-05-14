@@ -17,7 +17,7 @@ SET ( liboslexec_srcs
 #          llvm_util.cpp llvm_util_old.cpp
     )
 
-if (${OSL_LLVM_VERSION} LESS 38)
+if (${OSL_LLVM_VERSION} LESS 36)
     list (APPEND liboslexec_srcs llvm_util_old)
 else ()
     list (APPEND liboslexec_srcs llvm_util)
