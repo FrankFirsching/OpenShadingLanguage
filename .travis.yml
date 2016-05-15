@@ -31,8 +31,8 @@ addons:
       - g++-6
       - libboost1.55-all-dev
       - libtiff4-dev
-      - llvm-3.4-dev
-      - clang-3.4
+      - llvm3.8
+      - clang-3.8
 
 cache:
     ccache: true
@@ -59,7 +59,7 @@ install:
     - export CCACHE_CPP2=1
     - if [ $TRAVIS_OS_NAME == osx ] ; then
           src/build-scripts/install_homebrew_deps.bash ;
-          export LLVM_DIRECTORY=/usr/local/Cellar/llvm34/3.4.2/lib/llvm-3.4 ;
+          export LLVM_DIRECTORY=/usr/local/opt/llvm38/lib/llvm-3.8 ;
       elif [ $TRAVIS_OS_NAME == linux ] ; then
           CXX="ccache $CXX" CCACHE_CPP2=1 src/build-scripts/build_openexr.bash ;
           export ILMBASE_HOME=$PWD/openexr-install ;
