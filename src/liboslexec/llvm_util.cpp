@@ -345,6 +345,7 @@ public:
                           .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
                           .setErrorStr (&engine_errors);
             m_llvm_exec.reset (engine_builder.create());
+            // FIXME: check for errors here, report
             m_llvm_exec->InstallLazyFunctionCreator (m_lazy_func_resolver);
             m_llvm_exec->finalizeObject ();
         }

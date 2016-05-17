@@ -233,6 +233,9 @@ simple ()
                       .setOptLevel (llvm::CodeGenOpt::Default) // Aggressive?
                       .setErrorStr (&engine_errors);
         EE.reset (engine_builder.create());
+        if (! EE)
+            std::cout << engine_errors << "\n";
+        ASSERT (EE);
         EE->finalizeObject ();
     }
 
