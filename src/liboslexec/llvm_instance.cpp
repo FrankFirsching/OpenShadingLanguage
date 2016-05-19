@@ -168,10 +168,8 @@ helper_function_lookup (const std::string &name)
 {
     HelperFuncMap::const_iterator i = llvm_helper_function_map.find (name);
     if (i == llvm_helper_function_map.end()) {
-        std::cout << "Helper function lookup '" << name << "' : not found\n";
         return NULL;
     }
-    std::cout << "Helper function lookup '" << name << "' : " << (void*)i->second.function << "\n";
     return (void *) i->second.function;
 }
 

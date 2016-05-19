@@ -146,6 +146,7 @@ test_int_func ()
 #include <llvm/IR/Mangler.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/IPO.h>
@@ -161,6 +162,16 @@ inline std::vector<T> singletonSet (T t)
     return Vec;
 }
 
+std::string
+mangle (const std::string &Name, llvm::DataLayout &DL)
+{
+    std::string MangledName;
+    llvm::raw_string_ostream MangledNameStream (MangledName);
+    llvm::Mangler::getNameWithPrefix (MangledNameStream, Name, DL);
+    return MangledName;
+}
+
+
 
 extern "C" {
 // __attribute__ ((visibility ("default")))
@@ -175,6 +186,7 @@ simple ()
     llvm::InitializeAllTargetMCs();
     llvm::InitializeAllAsmPrinters();
     llvm::InitializeAllAsmParsers();
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently (nullptr);
     llvm::LLVMContext Context;
     std::unique_ptr<llvm::TargetMachine> TM (llvm::EngineBuilder().selectTarget());
     std::unique_ptr<llvm::DataLayout> DL;
@@ -243,7 +255,7 @@ simple ()
     typedef float (*FuncFloatFloat)(float);
     FuncFloatFloat my_executable_function = NULL;
     if (orc) {
-        auto ExprSymbol = Compilelayer.findSymbol ("myfunc", true);
+        auto ExprSymbol = Compilelayer.findSymbol (mangle("myfunc", *DL), true);
         my_executable_function = (FuncFloatFloat) ExprSymbol.getAddress ();
     } else {
         my_executable_function = (FuncFloatFloat) EE->getFunctionAddress ("myfunc");

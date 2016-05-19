@@ -312,13 +312,13 @@ public:
         //         return Sym;
         if (auto sym = m_orc_compilelayer->findSymbol (name, true))
             return sym;
-        std::cout << "Second try on " << name << "\n";
+        // std::cout << "Second try on " << name << "\n";
         // If we can't find the symbol in the JIT, try looking in the host process.
         if (auto symAddr = llvm::RTDyldMemoryManager::getSymbolAddressInProcess(name)) {
-            std::cout << " FOUND mangled in process " << name << "\n";
+            // std::cout << " FOUND mangled in process " << name << "\n";
             return llvm::orc::JITSymbol (symAddr, llvm::JITSymbolFlags::Exported);
         }
-        std::cout << "  whoa, failed second try\n";
+        // std::cout << "  whoa, failed second try\n";
         return llvm::orc::JITSymbol(nullptr);
     }
 
