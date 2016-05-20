@@ -51,6 +51,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <llvm/IR/Mangler.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/IPO.h>
@@ -529,6 +530,10 @@ LLVM_Util::Impl::initialize_llvm ()
     llvm::InitializeAllAsmPrinters();
     llvm::InitializeAllAsmParsers();
     // llvm::InitializeAllDisassemblers();
+
+    // This is necessary to make sure that we can find symbols in our
+    // own executable.
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently (nullptr);
 
 #if 0
     if (debug()) {

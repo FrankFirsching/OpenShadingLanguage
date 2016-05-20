@@ -408,8 +408,8 @@ main (int argc, char *argv[])
     getargs (argc, argv);
 
     // Test simple functions
-    // test_int_func();
-    // test_triple_func();
+    test_int_func();
+    test_triple_func();
     simple ();
 
     if (memtest) {
