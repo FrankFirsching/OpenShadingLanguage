@@ -693,10 +693,6 @@ private:
         return p;
     }
 
-    /// Set up LLVM -- make sure we have a Context, Module, ExecutionEngine,
-    /// retained JITMemoryManager, etc.
-    void SetupLLVM ();
-
     void setup_op_descriptors ();
 
     RendererServices *m_renderer;         ///< Renderer services
