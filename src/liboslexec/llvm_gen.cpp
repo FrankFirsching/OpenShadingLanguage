@@ -2261,7 +2261,7 @@ LLVMGEN (llvm_gen_texture)
     args.push_back (rop.ll.void_ptr (dalphadx ? dalphadx : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_texture", &args[0], (int)args.size());
+    rop.ll.call_function ("osl_texture", args);
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
@@ -2338,7 +2338,7 @@ LLVMGEN (llvm_gen_texture3d)
     args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr_null());  // No dalphadz for now
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_texture3d", &args[0], (int)args.size());
+    rop.ll.call_function ("osl_texture3d", args);
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
@@ -2406,7 +2406,7 @@ LLVMGEN (llvm_gen_environment)
         args.push_back (rop.ll.void_ptr_null());
     }
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_environment", &args[0], (int)args.size());
+    rop.ll.call_function ("osl_environment", args);
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
