@@ -650,7 +650,8 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_optimize_nondebug(false),
       m_opt_passes(10),
       m_llvm_optimize(0), m_llvm_orcjit(false),
-      m_debug(0), m_llvm_debug(0), m_llvm_debug_layers(0),
+      m_debug(0), m_llvm_debug(0),
+      m_llvm_debug_layers(0), m_llvm_debug_ops(0),
       m_commonspace_synonym("world"),
       m_colorspace("Rec709"),
       m_max_local_mem_KB(2048),
@@ -1068,6 +1069,7 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
     ATTR_SET ("llvm_orcjit", int, m_llvm_orcjit);
     ATTR_SET ("llvm_debug", int, m_llvm_debug);
     ATTR_SET ("llvm_debug_layers", int, m_llvm_debug_layers);
+    ATTR_SET ("llvm_debug_ops", int, m_llvm_debug_ops);
     ATTR_SET ("strict_messages", int, m_strict_messages);
     ATTR_SET ("range_checking", int, m_range_checking);
     ATTR_SET ("unknown_coordsys_error", int, m_unknown_coordsys_error);
@@ -1177,6 +1179,7 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     ATTR_DECODE ("debug", int, m_debug);
     ATTR_DECODE ("llvm_debug", int, m_llvm_debug);
     ATTR_DECODE ("llvm_debug_layers", int, m_llvm_debug_layers);
+    ATTR_DECODE ("llvm_debug_ops", int, m_llvm_debug_ops);
     ATTR_DECODE ("strict_messages", int, m_strict_messages);
     ATTR_DECODE ("range_checking", int, m_range_checking);
     ATTR_DECODE ("unknown_coordsys_error", int, m_unknown_coordsys_error);
@@ -1589,6 +1592,7 @@ ShadingSystemImpl::getstats (int level) const
     INTOPT (profile);
     INTOPT (llvm_debug);
     BOOLOPT (llvm_debug_layers);
+    BOOLOPT (llvm_debug_ops);
     BOOLOPT (lazylayers);
     BOOLOPT (lazyglobals);
     BOOLOPT (lazyunconnected);
