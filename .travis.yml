@@ -2,19 +2,9 @@
 
 language: cpp
 sudo: false
-compiler:
-    - clang
-    - gcc
-os:
-    - linux
-    - osx
 osx_image: xcode6.4
 dist: precise
 
-env:
-    matrix:
-      - USE_CPP11=1
-      - DEBUG=1
 
 # Add-ons: specify apt packages for Linux
 addons:
@@ -108,7 +98,27 @@ matrix:
         compiler: gcc
       - os: linux
         compiler: clang
+
     include:
+    # test default compile: C++11, optimized, default compilers
+      - os: linux
+        compiler: gcc
+      - os: osx
+        compiler: clang
+    # test debug build
+      - os: linux
+        compiler: gcc
+        env: DEBUG=1
+      - os: osx
+        compiler: clang
+        env: DEBUG=1
+    # test with C++14, most modern compiler
+      # - os: osx
+      #   compiler: clang
+      #   env: USE_CPP=14
+      - os: linux
+        compiler: gcc
+        env: WHICHGCC=6 USE_CPP=14
     # Test against the older release branch of OIIO (all the other tests
     # are against OIIO master)
       - os: linux
