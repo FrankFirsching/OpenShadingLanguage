@@ -20,7 +20,7 @@ find_library ( OPENIMAGEIO_LIBRARY_RELEASE
                PATH_SUFFIXES lib64 lib
                PATHS "${OPENIMAGEIOHOME}/lib" )
 find_library ( OPENIMAGEIO_LIBRARY_DEBUG
-               NAMES OpenImageIO_d
+               NAMES OpenImageIO_d OpenImageIO
                HINTS ${OPENIMAGEIOHOME}
                PATH_SUFFIXES lib64 lib
                PATHS "${OPENIMAGEIOHOME}/lib" )
