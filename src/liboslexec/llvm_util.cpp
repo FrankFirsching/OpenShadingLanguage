@@ -57,6 +57,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Utils/UnifyFunctionExitNodes.h>
 
 #if USE_ORC_JIT
@@ -735,7 +736,7 @@ LLVM_Util::Impl::setup_optimization_passes (int optlevel)
         mpm.add (llvm::createCFGSimplificationPass());
         // Change memory references to registers
         //  mpm.add (llvm::createPromoteMemoryToRegisterPass());
-        mpm.add (llvm::createScalarReplAggregatesPass());
+        mpm.add (llvm::createSROAPass());
         // Combine instructions where possible -- peephole opts & bit-twiddling
         mpm.add (llvm::createInstructionCombiningPass());
         // Inline small functions
@@ -956,7 +957,7 @@ LLVM_Util::return_block () const
 
 
 
-void 
+void
 LLVM_Util::push_loop (llvm::BasicBlock *step, llvm::BasicBlock *after)
 {
     m_impl->push_loop (step, after);
@@ -964,7 +965,7 @@ LLVM_Util::push_loop (llvm::BasicBlock *step, llvm::BasicBlock *after)
 
 
 
-void 
+void
 LLVM_Util::pop_loop ()
 {
     m_impl->pop_loop ();

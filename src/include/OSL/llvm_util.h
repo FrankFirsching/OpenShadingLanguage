@@ -60,8 +60,8 @@ namespace llvm {
   class PointerType;
   class Type;
   class Value;
-  template<bool preserveNames, typename T, typename Inserter> class IRBuilder;
-  template<bool preserveNames> class IRBuilderDefaultInserter;
+  template<typename T, typename Inserter> class IRBuilder;
+  class IRBuilderDefaultInserter;
 }
 
 
@@ -79,8 +79,8 @@ public:
     ~LLVM_Util ();
 
     struct PerThreadInfo;
-    typedef llvm::IRBuilder<true,llvm::ConstantFolder,
-                            llvm::IRBuilderDefaultInserter<true> > IRBuilder;
+    typedef llvm::IRBuilder<llvm::ConstantFolder,
+                            llvm::IRBuilderDefaultInserter> IRBuilder;
 
     /// Set debug level
     void debug (int d);
