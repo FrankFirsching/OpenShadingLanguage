@@ -46,7 +46,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/fmath.h>
 
 #include "oslexec_pvt.h"
-#include "dual_vec.h"
+#include "OSL/dual_vec.h"
 #include "splineimpl.h"
 
 
@@ -90,12 +90,6 @@ static Spline::SplineBasis gBasisSet[kNumSplineTypes] = {
 OSL_NAMESPACE_ENTER
 
 namespace pvt {
-
-
-// This symbol is strictly to force linkage of this file when building
-// static library.
-int opspline_cpp_dummy = 1;
-
 
 
 const Spline::SplineBasis *Spline::getSplineBasis(const ustring &basis_name)
@@ -160,8 +154,8 @@ OSL_SHADEOP void  osl_spline_dvdfv(void *out, const char *spline_, void *x,
                                    Vec3 *knots, int knot_count, int knot_arraylen)
 {
    const Spline::SplineBasis *spline = Spline::getSplineBasis(USTR(spline_));
-   Spline::spline_evaluate<Vec3, float, Vec3, Vec3, false>
-      (spline, *(Vec3 *)out, *(float *)x, knots, knot_count, knot_arraylen);
+   Spline::spline_evaluate<Dual2<Vec3>, Dual2<float>, Vec3, Vec3, false>
+      (spline, DVEC(out), DFLOAT(x), knots, knot_count, knot_arraylen);
 }
 
 OSL_SHADEOP void  osl_spline_dvfdv(void *out, const char *spline_, void *x, 

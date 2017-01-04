@@ -31,7 +31,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/fmath.h>
 
 #include "oslexec_pvt.h"
-#include "genclosure.h"
+#include "OSL/genclosure.h"
 #include "backendllvm.h"
 
 using namespace OSL;
@@ -61,6 +61,7 @@ static ustring op_ge("ge");
 static ustring op_gt("gt");
 static ustring op_if("if");
 static ustring op_le("le");
+static ustring op_logb("logb");
 static ustring op_lt("lt");
 static ustring op_min("min");
 static ustring op_neq("neq");
@@ -80,6 +81,7 @@ static ustring op_xor("xor");
 
 static ustring u_distance ("distance");
 static ustring u_index ("index");
+static ustring u__empty;  // empty/default ustring
 
 
 
@@ -97,12 +99,30 @@ LLVMGEN (llvm_gen_generic);
 
 
 void
-BackendLLVM::llvm_gen_debug_printf (const std::string &message)
+BackendLLVM::llvm_gen_debug_printf (string_view message)
 {
-    ustring s = ustring::format ("(%s %s) %s", inst()->shadername().c_str(),
-                                 inst()->layername().c_str(), message.c_str());
+    ustring s = ustring::format ("(%s %s) %s", inst()->shadername(),
+                                 inst()->layername(), message);
     ll.call_function ("osl_printf", sg_void_ptr(), ll.constant("%s\n"),
                       ll.constant(s));
+}
+
+
+
+void
+BackendLLVM::llvm_gen_warning (string_view message)
+{
+    ll.call_function ("osl_warning", sg_void_ptr(), ll.constant("%s\n"),
+                      ll.constant(message));
+}
+
+
+
+void
+BackendLLVM::llvm_gen_error (string_view message)
+{
+    ll.call_function ("osl_error", sg_void_ptr(), ll.constant("%s\n"),
+                      ll.constant(message));
 }
 
 
@@ -111,14 +131,12 @@ void
 BackendLLVM::llvm_call_layer (int layer, bool unconditional)
 {
     // Make code that looks like:
-    //     if (! groupdata->run[parentlayer]) {
-    //         groupdata->run[parentlayer] = 1;
+    //     if (! groupdata->run[parentlayer])
     //         parent_layer (sg, groupdata);
-    //     }
     // if it's a conditional call, or
-    //     groupdata->run[parentlayer] = 1;
     //     parent_layer (sg, groupdata);
     // if it's run unconditionally.
+    // The code in the parent layer itself will set its 'executed' flag.
 
     llvm::Value *args[2];
     args[0] = sg_ptr ();
@@ -126,7 +144,7 @@ BackendLLVM::llvm_call_layer (int layer, bool unconditional)
 
     ShaderInstance *parent = group()[layer];
     llvm::Value *trueval = ll.constant_bool(true);
-    llvm::Value *layerfield = layer_run_ptr(layer_remap(layer));
+    llvm::Value *layerfield = layer_run_ref(layer_remap(layer));
     llvm::BasicBlock *then_block = NULL, *after_block = NULL;
     if (! unconditional) {
         llvm::Value *executed = ll.op_load (layerfield);
@@ -137,12 +155,12 @@ BackendLLVM::llvm_call_layer (int layer, bool unconditional)
         // insert point is now then_block
     }
 
-    ll.op_store (trueval, layerfield);
     std::string name = Strutil::format ("%s_%d", parent->layername().c_str(),
                                         parent->id());
     // Mark the call as a fast call
-    llvm::Value *funccall = ll.call_function (name.c_str(), args, 2);
-    ll.mark_fast_func_call (funccall);
+    llvm::Value *funccall = ll.call_function (name, args);
+    if (!parent->entry_layer())
+        ll.mark_fast_func_call (funccall);
 
     if (! unconditional)
         ll.op_branch (after_block);  // also moves insert point
@@ -165,6 +183,9 @@ BackendLLVM::llvm_run_connected_layers (Symbol &sym, int symindex,
         const Connection &con (inst()->connection (c));
         // If the connection gives a value to this param
         if (con.dst.param == symindex) {
+            // already_run is a set of layers run for this particular op.
+            // Just so we don't stupidly do several consecutive checks on
+            // whether we ran this same layer. It's JUST for this op.
             if (already_run) {
                 if (already_run->count (con.srclayer))
                     continue;  // already ran that one on this op
@@ -172,16 +193,22 @@ BackendLLVM::llvm_run_connected_layers (Symbol &sym, int symindex,
                     already_run->insert (con.srclayer);  // mark it
             }
 
-            if (m_layers_already_run.count (con.srclayer)) {
-                if (debug() > 1)
-                    std::cout << "At op " << opnum << ", skip running layer "
-                              << con.srclayer << ", it already ran" << std::endl;
-                continue;  // already unconditionally ran the layer
-            }
-
-            if (inmain && ! m_in_conditional[opnum]) {
-                // Unconditionally running -- mark so we don't do it again
-                m_layers_already_run.insert (con.srclayer);
+            if (inmain) {
+                // There is an instance-wide m_layers_already_run that tries
+                // to remember which earlier layers have unconditionally
+                // been run at any point in the execution of this layer. But
+                // only honor (and modify) that when in the main code
+                // section, not when in init ops, which are inherently
+                // conditional.
+                if (m_layers_already_run.count (con.srclayer)) {
+                    continue;  // already unconditionally ran the layer
+                }
+                if (! m_in_conditional[opnum]) {
+                    // Unconditionally running -- mark so we don't do it
+                    // again. If we're inside a conditional, don't mark
+                    // because it may not execute the conditional body.
+                    m_layers_already_run.insert (con.srclayer);
+                }
             }
 
             // If the earlier layer it comes from has not yet been
@@ -189,6 +216,13 @@ BackendLLVM::llvm_run_connected_layers (Symbol &sym, int symindex,
             llvm_call_layer (con.srclayer);
         }
     }
+}
+
+
+
+LLVMGEN (llvm_gen_nop)
+{
+    return true;
 }
 
 
@@ -207,6 +241,14 @@ LLVMGEN (llvm_gen_useparam)
         Symbol& sym = *rop.opargsym (op, i);
         int symindex = rop.inst()->arg (op.firstarg()+i);
         rop.llvm_run_connected_layers (sym, symindex, opnum, &already_run);
+        // If it's an interpolated (userdata) parameter and we're
+        // initializing them lazily, now we have to do it.
+        if (sym.symtype() == SymTypeParam
+                && ! sym.lockgeom() && ! sym.typespec().is_closure()
+                && ! sym.connected() && ! sym.connected_down()
+                && rop.shadingsys().lazy_userdata()) {
+            rop.llvm_assign_initial_value (sym);
+        }
     }
     return true;
 }
@@ -227,7 +269,7 @@ LLVMGEN (llvm_gen_printf)
 
     std::vector<llvm::Value*> call_args;
     if (!format_sym.is_constant()) {
-        rop.shadingsys().warning ("%s must currently have constant format\n",
+        rop.shadingcontext()->warning ("%s must currently have constant format\n",
                                   op.opname().c_str());
         return false;
     }
@@ -264,7 +306,7 @@ LLVMGEN (llvm_gen_printf)
                 ++format;
             char formatchar = *format++;  // Also eat the format char
             if (arg >= op.nargs()) {
-                rop.shadingsys().error ("Mismatch between format string and arguments (%s:%d)",
+                rop.shadingcontext()->error ("Mismatch between format string and arguments (%s:%d)",
                                         op.sourcefile().c_str(), op.sourceline());
                 return false;
             }
@@ -308,7 +350,7 @@ LLVMGEN (llvm_gen_printf)
                     s += ourformat;
 
                     llvm::Value* loaded = rop.llvm_load_value (sym, 0, arrind, c);
-                    if (sym.typespec().is_floatbased()) {
+                    if (simpletype.basetype == TypeDesc::FLOAT) {
                         // C varargs convention upconverts float->double.
                         loaded = rop.ll.op_float_to_double(loaded);
                     }
@@ -336,8 +378,7 @@ LLVMGEN (llvm_gen_printf)
 
     // Construct the function name and call it.
     std::string opname = std::string("osl_") + op.opname().string();
-    llvm::Value *ret = rop.ll.call_function (opname.c_str(), &call_args[0],
-                                               (int)call_args.size());
+    llvm::Value *ret = rop.ll.call_function (opname, call_args);
 
     // The format op returns a string value, put in in the right spot
     if (op.opname() == op_format)
@@ -361,7 +402,7 @@ LLVMGEN (llvm_gen_add)
         valargs[0] = rop.sg_void_ptr();
         valargs[1] = rop.llvm_load_value (A);
         valargs[2] = rop.llvm_load_value (B);
-        llvm::Value *res = rop.ll.call_function ("osl_add_closure_closure", valargs, 3);
+        llvm::Value *res = rop.ll.call_function ("osl_add_closure_closure", valargs);
         rop.llvm_store_value (res, Result, 0, NULL, 0);
         return true;
     }
@@ -469,8 +510,8 @@ LLVMGEN (llvm_gen_mul)
             valargs[1] = rop.llvm_load_value (B);
             valargs[2] = tfloat ? rop.llvm_load_value (A) : rop.llvm_void_ptr(A);
         }
-        llvm::Value *res = tfloat ? rop.ll.call_function ("osl_mul_closure_float", valargs, 3)
-                                  : rop.ll.call_function ("osl_mul_closure_color", valargs, 3);
+        llvm::Value *res = tfloat ? rop.ll.call_function ("osl_mul_closure_float", valargs)
+                                  : rop.ll.call_function ("osl_mul_closure_color", valargs);
         rop.llvm_store_value (res, Result, 0, NULL, 0);
         return true;
     }
@@ -568,19 +609,28 @@ LLVMGEN (llvm_gen_div)
 
     // The following should handle f/f, v/v, v/f, f/v, i/i
     // That's all that should be allowed by oslc.
+    const char *safe_div = is_float ? "osl_safe_div_fff" : "osl_safe_div_iii";
     bool deriv = (Result.has_derivs() && (A.has_derivs() || B.has_derivs()));
     for (int i = 0; i < num_components; i++) {
         llvm::Value *a = rop.llvm_load_value (A, 0, i, type);
         llvm::Value *b = rop.llvm_load_value (B, 0, i, type);
         if (!a || !b)
             return false;
-        llvm::Value *a_div_b = rop.ll.op_make_safe_div (type, a, b);
+        llvm::Value *a_div_b;
+        if (B.is_constant() && ! rop.is_zero(B))
+            a_div_b = rop.ll.op_div (a, b);
+        else
+            a_div_b = rop.ll.call_function (safe_div, a, b);
         llvm::Value *rx = NULL, *ry = NULL;
 
         if (deriv) {
             // Division of duals: (a/b, 1/b*(ax-a/b*bx), 1/b*(ay-a/b*by))
             ASSERT (is_float);
-            llvm::Value *binv = rop.ll.op_make_safe_div (type, rop.ll.constant(1.0f), b);
+            llvm::Value *binv;
+            if (B.is_constant() && ! rop.is_zero(B))
+                binv = rop.ll.op_div (rop.ll.constant(1.0f), b);
+            else
+                binv = rop.ll.call_function (safe_div, rop.ll.constant(1.0f), b);
             llvm::Value *ax = rop.llvm_load_value (A, 1, i, type);
             llvm::Value *bx = rop.llvm_load_value (B, 1, i, type);
             llvm::Value *a_div_b_mul_bx = rop.ll.op_mul (a_div_b, bx);
@@ -630,12 +680,17 @@ LLVMGEN (llvm_gen_modulus)
 
     // The following should handle f%f, v%v, v%f, i%i
     // That's all that should be allowed by oslc.
+    const char *safe_mod = is_float ? "osl_fmod_fff" : "osl_safe_mod_iii";
     for (int i = 0; i < num_components; i++) {
         llvm::Value *a = rop.loadLLVMValue (A, i, 0, type);
         llvm::Value *b = rop.loadLLVMValue (B, i, 0, type);
         if (!a || !b)
             return false;
-        llvm::Value *r = rop.ll.op_make_safe_mod (type, a, b);
+        llvm::Value *r;
+        if (B.is_constant() && ! rop.is_zero(B))
+            r = rop.ll.op_mod (a, b);
+        else
+            r = rop.ll.call_function (safe_mod, a, b);
         rop.storeLLVMValue (r, Result, i, 0);
     }
 
@@ -910,7 +965,7 @@ LLVMGEN (llvm_gen_unary_op)
             result = rop.ll.op_not (src_val);
         } else {
             // Don't know how to handle this.
-            rop.shadingsys().error ("Don't know how to handle op '%s', eliding the store\n", opname.c_str());
+            rop.shadingcontext()->error ("Don't know how to handle op '%s', eliding the store\n", opname.c_str());
         }
 
         // Store the result
@@ -928,7 +983,7 @@ LLVMGEN (llvm_gen_unary_op)
 
         if (dst_derivs) {
             // mul results in <a * b, a * b_dx + b * a_dx, a * b_dy + b * a_dy>
-            rop.shadingsys().info ("punting on derivatives for now\n");
+            rop.shadingcontext()->info ("punting on derivatives for now\n");
             // FIXME!!
         }
     }
@@ -973,11 +1028,16 @@ LLVMGEN (llvm_gen_compref)
     if (rop.shadingsys().range_checking()) {
         if (! (Index.is_constant() &&  *(int *)Index.data() >= 0 &&
                *(int *)Index.data() < 3)) {
-            llvm::Value *args[5] = { c, rop.ll.constant(3),
-                                     rop.sg_void_ptr(),
-                                     rop.ll.constant(op.sourcefile()),
-                                     rop.ll.constant(op.sourceline()) };
-            c = rop.ll.call_function ("osl_range_check", args, 5);
+            llvm::Value *args[] = { c, rop.ll.constant(3),
+                                    rop.ll.constant(Val.name()),
+                                    rop.sg_void_ptr(),
+                                    rop.ll.constant(op.sourcefile()),
+                                    rop.ll.constant(op.sourceline()),
+                                    rop.ll.constant(rop.group().name()),
+                                    rop.ll.constant(rop.layer()),
+                                    rop.ll.constant(rop.inst()->layername()),
+                                    rop.ll.constant(rop.inst()->shadername()) };
+            c = rop.ll.call_function ("osl_range_check", args);
             ASSERT (c);
         }
     }
@@ -1012,11 +1072,16 @@ LLVMGEN (llvm_gen_compassign)
     if (rop.shadingsys().range_checking()) {
         if (! (Index.is_constant() &&  *(int *)Index.data() >= 0 &&
                *(int *)Index.data() < 3)) {
-            llvm::Value *args[5] = { c, rop.ll.constant(3),
-                                     rop.sg_void_ptr(),
-                                     rop.ll.constant(op.sourcefile()),
-                                     rop.ll.constant(op.sourceline()) };
-            c = rop.ll.call_function ("osl_range_check", args, 5);
+            llvm::Value *args[] = { c, rop.ll.constant(3),
+                                    rop.ll.constant(Result.name()),
+                                    rop.sg_void_ptr(),
+                                    rop.ll.constant(op.sourcefile()),
+                                    rop.ll.constant(op.sourceline()),
+                                    rop.ll.constant(rop.group().name()),
+                                    rop.ll.constant(rop.layer()),
+                                    rop.ll.constant(rop.inst()->layername()),
+                                    rop.ll.constant(rop.inst()->shadername()) };
+            c = rop.ll.call_function ("osl_range_check", args);
         }
     }
 
@@ -1049,13 +1114,18 @@ LLVMGEN (llvm_gen_mxcompref)
     llvm::Value *row = rop.llvm_load_value (Row);
     llvm::Value *col = rop.llvm_load_value (Col);
     if (rop.shadingsys().range_checking()) {
-        llvm::Value *args[5] = { row, rop.ll.constant(4),
-                                 rop.sg_void_ptr(),
-                                 rop.ll.constant(op.sourcefile()),
-                                 rop.ll.constant(op.sourceline()) };
-        row = rop.ll.call_function ("osl_range_check", args, 5);
+        llvm::Value *args[] = { row, rop.ll.constant(4),
+                                rop.ll.constant(M.name()),
+                                rop.sg_void_ptr(),
+                                rop.ll.constant(op.sourcefile()),
+                                rop.ll.constant(op.sourceline()),
+                                rop.ll.constant(rop.group().name()),
+                                rop.ll.constant(rop.layer()),
+                                rop.ll.constant(rop.inst()->layername()),
+                                rop.ll.constant(rop.inst()->shadername()) };
+        row = rop.ll.call_function ("osl_range_check", args);
         args[0] = col;
-        col = rop.ll.call_function ("osl_range_check", args, 5);
+        col = rop.ll.call_function ("osl_range_check", args);
     }
 
     llvm::Value *val = NULL; 
@@ -1089,13 +1159,18 @@ LLVMGEN (llvm_gen_mxcompassign)
     llvm::Value *row = rop.llvm_load_value (Row);
     llvm::Value *col = rop.llvm_load_value (Col);
     if (rop.shadingsys().range_checking()) {
-        llvm::Value *args[5] = { row, rop.ll.constant(4),
-                                 rop.sg_void_ptr(),
-                                 rop.ll.constant(op.sourcefile()),
-                                 rop.ll.constant(op.sourceline()) };
-        row = rop.ll.call_function ("osl_range_check", args, 5);
+        llvm::Value *args[] = { row, rop.ll.constant(4),
+                                rop.ll.constant(Result.name()),
+                                rop.sg_void_ptr(),
+                                rop.ll.constant(op.sourcefile()),
+                                rop.ll.constant(op.sourceline()),
+                                rop.ll.constant(rop.group().name()),
+                                rop.ll.constant(rop.layer()),
+                                rop.ll.constant(rop.inst()->layername()),
+                                rop.ll.constant(rop.inst()->shadername()) };
+        row = rop.ll.call_function ("osl_range_check", args);
         args[0] = col;
-        col = rop.ll.call_function ("osl_range_check", args, 5);
+        col = rop.ll.call_function ("osl_range_check", args);
     }
 
     llvm::Value *val = rop.llvm_load_value (Val, 0, 0, TypeDesc::TypeFloat);
@@ -1123,7 +1198,8 @@ LLVMGEN (llvm_gen_arraylength)
     Symbol& A = *rop.opargsym (op, 1);
     DASSERT (Result.typespec().is_int() && A.typespec().is_array());
 
-    int len = A.typespec().arraylength();
+    int len = A.typespec().is_unsized_array() ? A.initializers()
+                                              : A.typespec().arraylength();
     rop.llvm_store_value (rop.ll.constant(len), Result);
     return true;
 }
@@ -1145,12 +1221,17 @@ LLVMGEN (llvm_gen_aref)
     if (rop.shadingsys().range_checking()) {
         if (! (Index.is_constant() &&  *(int *)Index.data() >= 0 &&
                *(int *)Index.data() < Src.typespec().arraylength())) {
-            llvm::Value *args[5] = { index,
-                                     rop.ll.constant(Src.typespec().arraylength()),
-                                     rop.sg_void_ptr(),
-                                     rop.ll.constant(op.sourcefile()),
-                                     rop.ll.constant(op.sourceline()) };
-            index = rop.ll.call_function ("osl_range_check", args, 5);
+            llvm::Value *args[] = { index,
+                                    rop.ll.constant(Src.typespec().arraylength()),
+                                    rop.ll.constant(Src.name()),
+                                    rop.sg_void_ptr(),
+                                    rop.ll.constant(op.sourcefile()),
+                                    rop.ll.constant(op.sourceline()),
+                                    rop.ll.constant(rop.group().name()),
+                                    rop.ll.constant(rop.layer()),
+                                    rop.ll.constant(rop.inst()->layername()),
+                                    rop.ll.constant(rop.inst()->shadername()) };
+            index = rop.ll.call_function ("osl_range_check", args);
         }
     }
 
@@ -1184,12 +1265,17 @@ LLVMGEN (llvm_gen_aassign)
     if (rop.shadingsys().range_checking()) {
         if (! (Index.is_constant() &&  *(int *)Index.data() >= 0 &&
                *(int *)Index.data() < Result.typespec().arraylength())) {
-            llvm::Value *args[5] = { index,
-                                     rop.ll.constant(Result.typespec().arraylength()),
-                                     rop.sg_void_ptr(),
-                                     rop.ll.constant(op.sourcefile()),
-                                     rop.ll.constant(op.sourceline()) };
-            index = rop.ll.call_function ("osl_range_check", args, 5);
+            llvm::Value *args[] = { index,
+                                    rop.ll.constant(Result.typespec().arraylength()),
+                                    rop.ll.constant(Result.name()),
+                                    rop.sg_void_ptr(),
+                                    rop.ll.constant(op.sourcefile()),
+                                    rop.ll.constant(op.sourceline()),
+                                    rop.ll.constant(rop.group().name()),
+                                    rop.ll.constant(rop.layer()),
+                                    rop.ll.constant(rop.inst()->layername()),
+                                    rop.ll.constant(rop.inst()->shadername()) };
+            index = rop.ll.call_function ("osl_range_check", args);
         }
     }
 
@@ -1239,7 +1325,7 @@ LLVMGEN (llvm_gen_construct_color)
         args[0] = rop.sg_void_ptr ();  // shader globals
         args[1] = rop.llvm_void_ptr (Result, 0);  // color
         args[2] = rop.llvm_load_value (Space); // from
-        rop.ll.call_function ("osl_prepend_color_from", args, 3);
+        rop.ll.call_function ("osl_prepend_color_from", args);
         // FIXME(deriv): Punt on derivs for color ctrs with space names.
         // We should try to do this right, but we never had it right for
         // the interpreter, to it's probably not an emergency.
@@ -1302,10 +1388,10 @@ LLVMGEN (llvm_gen_construct_triple)
             // Note that for the case of non-constant strings, passing empty
             // from & to will make transform_points just tell us if ANY 
             // nonlinear transformations potentially are supported.
-            rop.ll.call_function ("osl_transform_triple_nonlinear", args, 8);
+            rop.ll.call_function ("osl_transform_triple_nonlinear", args);
         } else {
             // definitely not a nonlinear transformation
-            rop.ll.call_function ("osl_transform_triple", args, 8);
+            rop.ll.call_function ("osl_transform_triple", args);
         }
     }
 
@@ -1336,7 +1422,7 @@ LLVMGEN (llvm_gen_matrix)
         args[1] = rop.llvm_void_ptr(Result);  // result
         args[2] = rop.llvm_load_value(*rop.opargsym (op, 1));  // from
         args[3] = rop.llvm_load_value(*rop.opargsym (op, 2));  // to
-        rop.ll.call_function ("osl_get_from_to_matrix", args, 4);
+        rop.ll.call_function ("osl_get_from_to_matrix", args);
     } else {
         if (nfloats == 1) {
             for (int i = 0; i < 16; i++) {
@@ -1358,7 +1444,7 @@ LLVMGEN (llvm_gen_matrix)
             args[0] = rop.sg_void_ptr();  // shader globals
             args[1] = rop.llvm_void_ptr(Result);  // result
             args[2] = rop.llvm_load_value(*rop.opargsym (op, 1));  // from
-            rop.ll.call_function ("osl_prepend_matrix_from", args, 3);
+            rop.ll.call_function ("osl_prepend_matrix_from", args);
         }
     }
     if (Result.has_derivs())
@@ -1384,7 +1470,7 @@ LLVMGEN (llvm_gen_getmatrix)
     args[1] = rop.llvm_void_ptr(M);  // matrix result
     args[2] = rop.llvm_load_value(From);
     args[3] = rop.llvm_load_value(To);
-    llvm::Value *result = rop.ll.call_function ("osl_get_from_to_matrix", args, 4);
+    llvm::Value *result = rop.ll.call_function ("osl_get_from_to_matrix", args);
     rop.llvm_store_value (result, Result);
     rop.llvm_zero_derivs (M);
     return true;
@@ -1444,10 +1530,10 @@ LLVMGEN (llvm_gen_transform)
         // Note that for the case of non-constant strings, passing empty
         // from & to will make transform_points just tell us if ANY 
         // nonlinear transformations potentially are supported.
-        rop.ll.call_function ("osl_transform_triple_nonlinear", args, 8);
+        rop.ll.call_function ("osl_transform_triple_nonlinear", args);
     } else {
         // definitely not a nonlinear transformation
-        rop.ll.call_function ("osl_transform_triple", args, 8);
+        rop.ll.call_function ("osl_transform_triple", args);
     }
     return true;
 }
@@ -1652,8 +1738,7 @@ LLVMGEN (llvm_gen_regex)
     // Pass whether or not to do the full match
     call_args.push_back (rop.ll.constant(fullmatch));
 
-    llvm::Value *ret = rop.ll.call_function ("osl_regex_impl", &call_args[0],
-                                               (int)call_args.size());
+    llvm::Value *ret = rop.ll.call_function ("osl_regex_impl", call_args);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -1691,7 +1776,8 @@ LLVMGEN (llvm_gen_generic)
 
     // Special cases: functions that have no derivs -- suppress them
     if (any_deriv_args)
-        if (op.opname() == op_floor || op.opname() == op_ceil ||
+        if (op.opname() == op_logb  ||
+            op.opname() == op_floor || op.opname() == op_ceil ||
             op.opname() == op_round || op.opname() == op_step ||
             op.opname() == op_trunc || 
             op.opname() == op_sign)
@@ -1744,7 +1830,6 @@ LLVMGEN (llvm_gen_sincos)
     Symbol& Theta   = *rop.opargsym (op, 0);
     Symbol& Sin_out = *rop.opargsym (op, 1);
     Symbol& Cos_out = *rop.opargsym (op, 2);
-    std::vector<llvm::Value *> valargs;
     bool theta_deriv   = Theta.has_derivs();
     bool result_derivs = (Sin_out.has_derivs() || Cos_out.has_derivs());
 
@@ -1760,12 +1845,13 @@ LLVMGEN (llvm_gen_sincos)
         else ASSERT (0);
     }
     // push back llvm arguments
+    std::vector<llvm::Value *> valargs;
     valargs.push_back ( (theta_deriv && result_derivs) || Theta.typespec().is_triple() ? 
           rop.llvm_void_ptr (Theta) : rop.llvm_load_value (Theta));
     valargs.push_back (rop.llvm_void_ptr (Sin_out));
     valargs.push_back (rop.llvm_void_ptr (Cos_out));
 
-    rop.ll.call_function (name.c_str(), &valargs[0], 3);
+    rop.ll.call_function (name, valargs);
 
     // If the input angle didn't have derivatives, we would not have
     // called the version of sincos with derivs; however in that case we
@@ -1909,14 +1995,17 @@ static llvm::Value *
 llvm_gen_texture_options (BackendLLVM &rop, int opnum,
                           int first_optional_arg, bool tex3d, int nchans,
                           llvm::Value* &alpha, llvm::Value* &dalphadx,
-                          llvm::Value* &dalphady)
+                          llvm::Value* &dalphady, llvm::Value* &errormessage)
 {
-    // Reserve space for the TextureOpt, with alignment
-    int tosize = OIIO::round_to_multiple ((int)sizeof(TextureOpt), (int)sizeof(char*));
-    llvm::Value* opt = rop.ll.op_alloca (rop.ll.type_void_ptr(), tosize);
-    opt = rop.ll.void_ptr (opt);
-    rop.ll.call_function ("osl_texture_clear", opt);
+    llvm::Value* opt = rop.ll.call_function ("osl_get_texture_options",
+                                             rop.sg_void_ptr());
     llvm::Value* missingcolor = NULL;
+    TextureOpt optdefaults;  // So we can check the defaults
+    bool swidth_set = false, twidth_set = false, rwidth_set = false;
+    bool sblur_set = false, tblur_set = false, rblur_set = false;
+    bool swrap_set = false, twrap_set = false, rwrap_set = false;
+    bool firstchannel_set = false, fill_set = false, interp_set = false;
+    bool time_set = false, subimage_set = false;
 
     Opcode &op (rop.inst()->ops()[opnum]);
     for (int a = first_optional_arg;  a < op.nargs();  ++a) {
@@ -1925,119 +2014,137 @@ llvm_gen_texture_options (BackendLLVM &rop, int opnum,
                 "optional texture token must be a string");
         ASSERT (a+1 < op.nargs() && "malformed argument list for texture");
         ustring name = *(ustring *)Name.data();
-
         ++a;  // advance to next argument
-        Symbol &Val (*rop.opargsym(op,a));
-        TypeDesc valtype = Val.typespec().simpletype ();
-        
+
         if (! name)    // skip empty string param name
             continue;
-        llvm::Value *val = rop.llvm_load_value (Val);
 
-        // If certain float-expecting options were passed an int, do the
-        // conversion automatically.
-        if (valtype == TypeDesc::INT &&
-            (name == Strings::width || name == Strings::swidth ||
-             name == Strings::twidth || name == Strings::rwidth ||
-             name == Strings::blur || name == Strings::sblur ||
-             name == Strings::tblur || name == Strings::rblur)) {
-            val = rop.ll.op_int_to_float (val);
-            valtype = TypeDesc::FLOAT;
+        Symbol &Val (*rop.opargsym(op,a));
+        TypeDesc valtype = Val.typespec().simpletype ();
+        const int *ival = Val.typespec().is_int() && Val.is_constant() ? (const int *)Val.data() : NULL;
+        const float *fval = Val.typespec().is_float() && Val.is_constant() ? (const float *)Val.data() : NULL;
+
+#define PARAM_INT(paramname)                                            \
+        if (name == Strings::paramname && valtype == TypeDesc::INT)   { \
+            if (! paramname##_set &&                                    \
+                ival && *ival == optdefaults.paramname)                 \
+                continue;     /* default constant */                    \
+            llvm::Value *val = rop.llvm_load_value (Val);               \
+            rop.ll.call_function ("osl_texture_set_" #paramname, opt, val); \
+            paramname##_set = true;                                     \
+            continue;                                                   \
         }
 
-        if (name == Strings::width && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_swidth", opt, val);
-            rop.ll.call_function ("osl_texture_set_twidth", opt, val);
-            if (tex3d)
-                rop.ll.call_function ("osl_texture_set_rwidth", opt, val);
-        } else if (name == Strings::swidth && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_swidth", opt, val);
-        } else if (name == Strings::twidth && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_twidth", opt, val);
-        } else if (name == Strings::rwidth && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_rwidth", opt, val);
+#define PARAM_FLOAT(paramname)                                          \
+        if (name == Strings::paramname &&                               \
+            (valtype == TypeDesc::FLOAT || valtype == TypeDesc::INT)) { \
+            if (! paramname##_set &&                                    \
+                ((ival && *ival == optdefaults.paramname) ||            \
+                 (fval && *fval == optdefaults.paramname)))             \
+                continue;     /* default constant */                    \
+            llvm::Value *val = rop.llvm_load_value (Val);               \
+            if (valtype == TypeDesc::INT)                               \
+                val = rop.ll.op_int_to_float (val);                     \
+            rop.ll.call_function ("osl_texture_set_" #paramname, opt, val); \
+            paramname##_set = true;                                     \
+            continue;                                                   \
+        }
 
-        } else if (name == Strings::blur && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_sblur", opt, val);
-            rop.ll.call_function ("osl_texture_set_tblur", opt, val);
-            if (tex3d)
-                rop.ll.call_function ("osl_texture_set_rblur",opt, val);
-        } else if (name == Strings::sblur && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_sblur", opt, val);
-        } else if (name == Strings::tblur && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_tblur", opt, val);
-        } else if (name == Strings::rblur && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_rblur", opt, val);
+#define PARAM_FLOAT_STR(paramname)                                      \
+        if (name == Strings::paramname &&                               \
+            (valtype == TypeDesc::FLOAT || valtype == TypeDesc::INT)) { \
+            if (! s##paramname##_set && ! t##paramname##_set &&         \
+                ! r##paramname##_set &&                                 \
+                ((ival && *ival == optdefaults.s##paramname) ||         \
+                 (fval && *fval == optdefaults.s##paramname)))          \
+                continue;     /* default constant */                    \
+            llvm::Value *val = rop.llvm_load_value (Val);               \
+            if (valtype == TypeDesc::INT)                               \
+                val = rop.ll.op_int_to_float (val);                     \
+            rop.ll.call_function ("osl_texture_set_st" #paramname, opt, val); \
+            if (tex3d)                                                  \
+                rop.ll.call_function ("osl_texture_set_r" #paramname, opt, val); \
+            s##paramname##_set = true;                                  \
+            t##paramname##_set = true;                                  \
+            r##paramname##_set = true;                                  \
+            continue;                                                   \
+        }
 
-        } else if (name == Strings::wrap && valtype == TypeDesc::STRING) {
+#define PARAM_STRING_CODE(paramname,decoder,fieldname)                  \
+        if (name == Strings::paramname && valtype == TypeDesc::STRING) { \
+            if (Val.is_constant()) {                                    \
+                int code = decoder (*(ustring *)Val.data());            \
+                if (! paramname##_set && code == optdefaults.fieldname) \
+                    continue;                                           \
+                if (code >= 0) {                                        \
+                    llvm::Value *val = rop.ll.constant (code);          \
+                    rop.ll.call_function ("osl_texture_set_" #paramname "_code", opt, val); \
+                }                                                       \
+            } else {                                                    \
+                llvm::Value *val = rop.llvm_load_value (Val);           \
+                rop.ll.call_function ("osl_texture_set_" #paramname, opt, val); \
+            }                                                           \
+            paramname##_set = true;                                     \
+            continue;                                                   \
+        }
+
+        PARAM_FLOAT_STR (width)
+        PARAM_FLOAT (swidth)
+        PARAM_FLOAT (twidth)
+        PARAM_FLOAT (rwidth)
+        PARAM_FLOAT_STR (blur)
+        PARAM_FLOAT (sblur)
+        PARAM_FLOAT (tblur)
+        PARAM_FLOAT (rblur)
+
+        if (name == Strings::wrap && valtype == TypeDesc::STRING) {
             if (Val.is_constant()) {
-                int mode = TextureOpt::decode_wrapmode (*(char **)Val.data());
-                val = rop.ll.constant (mode);
-                rop.ll.call_function ("osl_texture_set_swrap_code", opt, val);
-                rop.ll.call_function ("osl_texture_set_twrap_code", opt, val);
+                int mode = TextureOpt::decode_wrapmode (*(ustring *)Val.data());
+                llvm::Value *val = rop.ll.constant (mode);
+                rop.ll.call_function ("osl_texture_set_stwrap_code", opt, val);
                 if (tex3d)
                     rop.ll.call_function ("osl_texture_set_rwrap_code", opt, val);
             } else {
-                rop.ll.call_function ("osl_texture_set_swrap", opt, val);
-                rop.ll.call_function ("osl_texture_set_twrap", opt, val);
+                llvm::Value *val = rop.llvm_load_value (Val);
+                rop.ll.call_function ("osl_texture_set_stwrap", opt, val);
                 if (tex3d)
                     rop.ll.call_function ("osl_texture_set_rwrap", opt, val);
             }
-        } else if (name == Strings::swrap && valtype == TypeDesc::STRING) {
-            if (Val.is_constant()) {
-                int mode = TextureOpt::decode_wrapmode (*(char **)Val.data());
-                val = rop.ll.constant (mode);
-                rop.ll.call_function ("osl_texture_set_swrap_code", opt, val);
-            } else 
-                rop.ll.call_function ("osl_texture_set_swrap", opt, val);
-        } else if (name == Strings::twrap && valtype == TypeDesc::STRING) {
-            if (Val.is_constant()) {
-                int mode = TextureOpt::decode_wrapmode (*(char **)Val.data());
-                val = rop.ll.constant (mode);
-                rop.ll.call_function ("osl_texture_set_twrap_code", opt, val);
-            } else
-                rop.ll.call_function ("osl_texture_set_twrap", opt, val);
-        } else if (name == Strings::rwrap && valtype == TypeDesc::STRING) {
-            if (Val.is_constant()) {
-                int mode = TextureOpt::decode_wrapmode (*(char **)Val.data());
-                val = rop.ll.constant (mode);
-                rop.ll.call_function ("osl_texture_set_rwrap_code", opt, val);
-            } else
-                rop.ll.call_function ("osl_texture_set_rwrap", opt, val);
+            swrap_set = twrap_set = rwrap_set = true;
+            continue;
+        }
+        PARAM_STRING_CODE(swrap, TextureOpt::decode_wrapmode, swrap)
+        PARAM_STRING_CODE(twrap, TextureOpt::decode_wrapmode, twrap)
+        PARAM_STRING_CODE(rwrap, TextureOpt::decode_wrapmode, rwrap)
 
-        } else if (name == Strings::firstchannel && valtype == TypeDesc::INT) {
-            rop.ll.call_function ("osl_texture_set_firstchannel", opt, val);
-        } else if (name == Strings::fill && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_fill", opt, val);
-        } else if (name == Strings::time && valtype == TypeDesc::FLOAT) {
-            rop.ll.call_function ("osl_texture_set_time", opt, val);
+        PARAM_FLOAT (fill)
+        PARAM_FLOAT (time)
+        PARAM_INT (firstchannel)
+        PARAM_INT (subimage)
 
-        } else if (name == Strings::interp && valtype == TypeDesc::STRING) {
-            // Try to decode the interp name string into an integer mode,
-            // so it doesn't have to happen at runtime.
-            int mode = -1;
-            if (Val.is_constant())
-                mode = tex_interp_to_code (*(ustring *)Val.data());
-            if (mode >= 0)
-                rop.ll.call_function ("osl_texture_set_interp_code", opt,
-                                        rop.ll.constant(mode));
-            else
-                rop.ll.call_function ("osl_texture_set_interp_name", opt, val);
-
-        } else if (name == Strings::subimage && valtype == TypeDesc::INT) {
-            rop.ll.call_function ("osl_texture_set_subimage", opt, val);
-        } else if (name == Strings::subimage && valtype == TypeDesc::STRING) {
+        if (name == Strings::subimage && valtype == TypeDesc::STRING) {
+            llvm::Value *val = rop.llvm_load_value (Val);
             rop.ll.call_function ("osl_texture_set_subimagename", opt, val);
+            subimage_set = true;
+            continue;
+        }
 
-        } else if (name == Strings::alpha && valtype == TypeDesc::FLOAT) {
+        PARAM_STRING_CODE (interp, tex_interp_to_code, interpmode)
+
+        if (name == Strings::alpha && valtype == TypeDesc::FLOAT) {
             alpha = rop.llvm_get_pointer (Val);
             if (Val.has_derivs()) {
                 dalphadx = rop.llvm_get_pointer (Val, 1);
                 dalphady = rop.llvm_get_pointer (Val, 2);
                 // NO z derivs!  dalphadz = rop.llvm_get_pointer (Val, 3);
             }
-
-        } else if (name == Strings::missingcolor &&
+            continue;
+        }
+        if (name == Strings::errormessage && valtype == TypeDesc::STRING) {
+            errormessage = rop.llvm_get_pointer (Val);
+            continue;
+        }
+        if (name == Strings::missingcolor &&
                    equivalent(valtype,TypeDesc::TypeColor)) {
             if (! missingcolor) {
                 // If not already done, allocate enough storage for the
@@ -2049,8 +2156,9 @@ llvm_gen_texture_options (BackendLLVM &rop, int opnum,
             }
             rop.ll.op_memcpy (rop.ll.void_ptr(missingcolor),
                               rop.llvm_void_ptr(Val), (int)sizeof(Color3));
-        } else if (name == Strings::missingalpha &&
-                   valtype == TypeDesc::FLOAT) {
+            continue;
+        }
+        if (name == Strings::missingalpha && valtype == TypeDesc::FLOAT) {
             if (! missingcolor) {
                 // If not already done, allocate enough storage for the
                 // missingcolor value (4 floats), and call the special 
@@ -2059,15 +2167,30 @@ llvm_gen_texture_options (BackendLLVM &rop, int opnum,
                 rop.ll.call_function ("osl_texture_set_missingcolor_arena",
                                       opt, missingcolor);
             }
+            llvm::Value *val = rop.llvm_load_value (Val);
             rop.ll.call_function ("osl_texture_set_missingcolor_alpha",
                                     opt, rop.ll.constant(nchans), val);
+            continue;
 
-        } else {
-            rop.shadingsys().error ("Unknown texture%s optional argument: \"%s\", <%s> (%s:%d)",
-                                    tex3d ? "3d" : "",
-                                    name.c_str(), valtype.c_str(),
-                                    op.sourcefile().c_str(), op.sourceline());
         }
+        rop.shadingcontext()->error ("Unknown texture%s optional argument: \"%s\", <%s> (%s:%d)",
+                                     tex3d ? "3d" : "",
+                                     name.c_str(), valtype.c_str(),
+                                     op.sourcefile().c_str(), op.sourceline());
+#undef PARAM_INT
+#undef PARAM_FLOAT
+#undef PARAM_FLOAT_STR
+#undef PARAM_STRING_CODE
+
+#if 0
+        // Helps me find any constant optional params that aren't elided
+        if (Name.is_constant() && Val.is_constant()) {
+            std::cout << "! texture constant optional arg '" << name << "'\n";
+            if (Val.typespec().is_float()) std::cout << "\tf " << *(float *)Val.data() << "\n";
+            if (Val.typespec().is_int()) std::cout << "\ti " << *(int *)Val.data() << "\n";
+            if (Val.typespec().is_string()) std::cout << "\t" << *(ustring *)Val.data() << "\n";
+        }
+#endif
     }
 
     return opt;
@@ -2096,15 +2219,25 @@ LLVMGEN (llvm_gen_texture)
 
     llvm::Value* opt;   // TextureOpt
     llvm::Value *alpha = NULL, *dalphadx = NULL, *dalphady = NULL;
+    llvm::Value *errormessage = NULL;
     opt = llvm_gen_texture_options (rop, opnum, first_optional_arg,
                                     false /*3d*/, nchans,
-                                    alpha, dalphadx, dalphady);
+                                    alpha, dalphadx, dalphady, errormessage);
 
     // Now call the osl_texture function, passing the options and all the
     // explicit args like texture coordinates.
     std::vector<llvm::Value *> args;
     args.push_back (rop.sg_void_ptr());
+    RendererServices::TextureHandle *texture_handle = NULL;
+#if OIIO_VERSION >= 10602
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+        texture_handle = rop.renderer()->get_texture_handle (*(ustring *)Filename.data());
+        if (! rop.renderer()->good (texture_handle))
+            texture_handle = NULL;
+    }
+#endif
     args.push_back (rop.llvm_load_value (Filename));
+    args.push_back (rop.ll.constant_ptr (texture_handle));
     args.push_back (opt);
     args.push_back (rop.llvm_load_value (S));
     args.push_back (rop.llvm_load_value (T));
@@ -2124,14 +2257,12 @@ LLVMGEN (llvm_gen_texture)
     args.push_back (rop.ll.void_ptr (rop.llvm_get_pointer (Result, 0)));
     args.push_back (rop.ll.void_ptr (rop.llvm_get_pointer (Result, 1)));
     args.push_back (rop.ll.void_ptr (rop.llvm_get_pointer (Result, 2)));
-    if (alpha) {
-        args.push_back (rop.ll.void_ptr (alpha));
-        args.push_back (rop.ll.void_ptr (dalphadx ? dalphadx : rop.ll.void_ptr_null()));
-        args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
-        rop.ll.call_function ("osl_texture_alpha", &args[0], (int)args.size());
-    } else {
-        rop.ll.call_function ("osl_texture", &args[0], (int)args.size());
-    }
+    args.push_back (rop.ll.void_ptr (alpha    ? alpha    : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr (dalphadx ? dalphadx : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
+    rop.ll.call_function ("osl_texture", args);
+    rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
 
@@ -2156,15 +2287,25 @@ LLVMGEN (llvm_gen_texture3d)
 
     llvm::Value* opt;   // TextureOpt
     llvm::Value *alpha = NULL, *dalphadx = NULL, *dalphady = NULL;
+    llvm::Value *errormessage = NULL;
     opt = llvm_gen_texture_options (rop, opnum, first_optional_arg,
                                     true /*3d*/, nchans,
-                                    alpha, dalphadx, dalphady);
+                                    alpha, dalphadx, dalphady, errormessage);
 
     // Now call the osl_texture3d function, passing the options and all the
     // explicit args like texture coordinates.
     std::vector<llvm::Value *> args;
     args.push_back (rop.sg_void_ptr());
+    RendererServices::TextureHandle *texture_handle = NULL;
+#if OIIO_VERSION >= 10602
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+        texture_handle = rop.renderer()->get_texture_handle (*(ustring *)Filename.data());
+        if (! rop.renderer()->good (texture_handle))
+            texture_handle = NULL;
+    }
+#endif
     args.push_back (rop.llvm_load_value (Filename));
+    args.push_back (rop.ll.constant_ptr (texture_handle));
     args.push_back (opt);
     args.push_back (rop.llvm_void_ptr (P));
     if (user_derivs) {
@@ -2192,15 +2333,13 @@ LLVMGEN (llvm_gen_texture3d)
     args.push_back (rop.ll.void_ptr (rop.llvm_void_ptr (Result, 1)));
     args.push_back (rop.ll.void_ptr (rop.llvm_void_ptr (Result, 2)));
     args.push_back (rop.ll.void_ptr_null());  // no dresultdz for now
-    if (alpha) {
-        args.push_back (rop.ll.void_ptr (alpha));
-        args.push_back (dalphadx ? rop.ll.void_ptr (dalphadx) : rop.ll.void_ptr_null());
-        args.push_back (dalphady ? rop.ll.void_ptr (dalphady) : rop.ll.void_ptr_null());
-        args.push_back (rop.ll.void_ptr_null());  // No dalphadz for now
-        rop.ll.call_function ("osl_texture3d_alpha", &args[0], (int)args.size());
-    } else {
-        rop.ll.call_function ("osl_texture3d", &args[0], (int)args.size());
-    }
+    args.push_back (rop.ll.void_ptr (alpha    ? alpha    : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr (dalphadx ? dalphadx : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
+    args.push_back (rop.ll.void_ptr_null());  // No dalphadz for now
+    args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
+    rop.ll.call_function ("osl_texture3d", args);
+    rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
 
@@ -2224,15 +2363,25 @@ LLVMGEN (llvm_gen_environment)
 
     llvm::Value* opt;   // TextureOpt
     llvm::Value *alpha = NULL, *dalphadx = NULL, *dalphady = NULL;
+    llvm::Value *errormessage = NULL;
     opt = llvm_gen_texture_options (rop, opnum, first_optional_arg,
                                     false /*3d*/, nchans,
-                                    alpha, dalphadx, dalphady);
+                                    alpha, dalphadx, dalphady, errormessage);
 
     // Now call the osl_environment function, passing the options and all the
     // explicit args like texture coordinates.
     std::vector<llvm::Value *> args;
     args.push_back (rop.sg_void_ptr());
+    RendererServices::TextureHandle *texture_handle = NULL;
+#if OIIO_VERSION >= 10602
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+        texture_handle = rop.renderer()->get_texture_handle (*(ustring *)Filename.data());
+        if (! rop.renderer()->good (texture_handle))
+            texture_handle = NULL;
+    }
+#endif
     args.push_back (rop.llvm_load_value (Filename));
+    args.push_back (rop.ll.constant_ptr (texture_handle));
     args.push_back (opt);
     args.push_back (rop.llvm_void_ptr (R));
     if (user_derivs) {
@@ -2256,7 +2405,9 @@ LLVMGEN (llvm_gen_environment)
         args.push_back (rop.ll.void_ptr_null());
         args.push_back (rop.ll.void_ptr_null());
     }
-    rop.ll.call_function ("osl_environment", &args[0], (int)args.size());
+    args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
+    rop.ll.call_function ("osl_environment", args);
+    rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
 
@@ -2266,12 +2417,8 @@ static llvm::Value *
 llvm_gen_trace_options (BackendLLVM &rop, int opnum,
                         int first_optional_arg)
 {
-    // Reserve space for the TraceOpt, with alignment
-    int tosize = OIIO::round_to_multiple ((int)sizeof(RendererServices::TraceOpt), (int)sizeof(char*));
-    llvm::Value* opt = rop.ll.op_alloca (rop.ll.type_void_ptr(), tosize);
-    opt = rop.ll.void_ptr (opt);
-    rop.ll.call_function ("osl_trace_clear", opt);
-
+    llvm::Value* opt = rop.ll.call_function ("osl_get_trace_options",
+                                             rop.sg_void_ptr());
     Opcode &op (rop.inst()->ops()[opnum]);
     for (int a = first_optional_arg;  a < op.nargs();  ++a) {
         Symbol &Name (*rop.opargsym(op,a));
@@ -2296,7 +2443,7 @@ llvm_gen_trace_options (BackendLLVM &rop, int opnum,
         } else if (name == ktraceset && valtype == TypeDesc::STRING) {
             rop.ll.call_function ("osl_trace_set_traceset", opt, val);
         } else {
-            rop.shadingsys().error ("Unknown trace() optional argument: \"%s\", <%s> (%s:%d)",
+            rop.shadingcontext()->error ("Unknown trace() optional argument: \"%s\", <%s> (%s:%d)",
                                     name.c_str(), valtype.c_str(),
                                     op.sourcefile().c_str(), op.sourceline());
         }
@@ -2329,8 +2476,7 @@ LLVMGEN (llvm_gen_trace)
     args.push_back (rop.llvm_void_ptr (Dir, 0));
     args.push_back (rop.llvm_void_ptr (Dir, 1));
     args.push_back (rop.llvm_void_ptr (Dir, 2));
-    llvm::Value *r = rop.ll.call_function ("osl_trace", &args[0],
-                                             (int)args.size());
+    llvm::Value *r = rop.ll.call_function ("osl_trace", args);
     rop.llvm_store_value (r, Result);
     return true;
 }
@@ -2365,12 +2511,8 @@ static llvm::Value *
 llvm_gen_noise_options (BackendLLVM &rop, int opnum,
                         int first_optional_arg)
 {
-    // Reserve space for the NoiseParams, with alignment
-    int optsize = OIIO::round_to_multiple ((int)sizeof(NoiseParams), (int)sizeof(char*));
-    llvm::Value* opt = rop.ll.op_alloca (rop.ll.type_void_ptr(), optsize);
-    opt = rop.ll.void_ptr (opt);
-    rop.ll.call_function ("osl_noiseparams_clear", opt);
-
+    llvm::Value* opt = rop.ll.call_function ("osl_get_noise_options",
+                                             rop.sg_void_ptr());
     Opcode &op (rop.inst()->ops()[opnum]);
     for (int a = first_optional_arg;  a < op.nargs();  ++a) {
         Symbol &Name (*rop.opargsym(op,a));
@@ -2406,7 +2548,7 @@ llvm_gen_noise_options (BackendLLVM &rop, int opnum,
                                     rop.llvm_load_value (Val, 0, NULL, 0,
                                                          TypeDesc::TypeFloat));
         } else {
-            rop.shadingsys().error ("Unknown %s optional argument: \"%s\", <%s> (%s:%d)",
+            rop.shadingcontext()->error ("Unknown %s optional argument: \"%s\", <%s> (%s:%d)",
                                     op.opname().c_str(),
                                     name.c_str(), valtype.c_str(),
                                     op.sourcefile().c_str(), op.sourceline());
@@ -2428,7 +2570,8 @@ llvm_gen_noise_options (BackendLLVM &rop, int opnum,
 LLVMGEN (llvm_gen_noise)
 {
     Opcode &op (rop.inst()->ops()[opnum]);
-    bool periodic = (op.opname() == Strings::pnoise);
+    bool periodic = (op.opname() == Strings::pnoise ||
+                     op.opname() == Strings::psnoise);
 
     int arg = 0;   // Next arg to read
     Symbol &Result = *rop.opargsym (op, arg++);
@@ -2503,10 +2646,27 @@ LLVMGEN (llvm_gen_noise)
         derivs = true;
         name = periodic ? Strings::gaborpnoise : Strings::gabornoise;
     } else {
-        rop.shadingsys().error ("%snoise type \"%s\" is unknown, called from (%s:%d)",
+        rop.shadingcontext()->error ("%snoise type \"%s\" is unknown, called from (%s:%d)",
                                 (periodic ? "periodic " : ""), name.c_str(),
                                 op.sourcefile().c_str(), op.sourceline());
         return false;
+    }
+
+    if (rop.shadingsys().no_noise()) {
+        // renderer option to replace noise with constant value. This can be
+        // useful as a profiling aid, to see how much it speeds up to have
+        // trivial expense for noise calls.
+        if (name == Strings::uperlin || name == Strings::noise ||
+            name == Strings::usimplexnoise || name == Strings::usimplex ||
+            name == Strings::cell || name == Strings::cellnoise ||
+            name == Strings::pcellnoise || name == Strings::pnoise)
+            name = ustring("unullnoise");
+        else
+            name = ustring("nullnoise");
+        pass_name = false;
+        periodic = false;
+        pass_sg = false;
+        pass_options = false;
     }
 
     llvm::Value *opt = NULL;
@@ -2555,8 +2715,7 @@ LLVMGEN (llvm_gen_noise)
         llvm::outs() << "    " << *args[i] << "\n";
 #endif
 
-    llvm::Value *r = rop.ll.call_function (funcname.c_str(),
-                                             &args[0], (int)args.size());
+    llvm::Value *r = rop.ll.call_function (funcname, args);
     if (outdim == 1 && !derivs) {
         // Just plain float (no derivs) returns its value
         rop.llvm_store_value (r, Result);
@@ -2574,6 +2733,9 @@ LLVMGEN (llvm_gen_noise)
     // Clear derivs if result has them but we couldn't compute them
     if (Result.has_derivs() && !derivs)
         rop.llvm_zero_derivs (Result);
+
+    if (rop.shadingsys().profile() >= 1)
+        rop.ll.call_function ("osl_count_noise", rop.sg_void_ptr());
 
     return true;
 }
@@ -2628,7 +2790,7 @@ LLVMGEN (llvm_gen_getattribute)
     args.push_back (rop.ll.constant_ptr ((void *) dest_type));
     args.push_back (rop.llvm_void_ptr (Destination));
 
-    llvm::Value *r = rop.ll.call_function ("osl_get_attribute", &args[0], args.size());
+    llvm::Value *r = rop.ll.call_function ("osl_get_attribute", args);
     rop.llvm_store_value (r, Result);
 
     return true;
@@ -2656,7 +2818,16 @@ LLVMGEN (llvm_gen_gettextureinfo)
     std::vector<llvm::Value *> args;
 
     args.push_back (rop.sg_void_ptr());
+    RendererServices::TextureHandle *texture_handle = NULL;
+#if OIIO_VERSION >= 10602
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+        texture_handle = rop.renderer()->get_texture_handle (*(ustring *)Filename.data());
+        if (! rop.renderer()->good (texture_handle))
+            texture_handle = NULL;
+    }
+#endif
     args.push_back (rop.llvm_load_value (Filename));
+    args.push_back (rop.ll.constant_ptr (texture_handle));
     args.push_back (rop.llvm_load_value (Dataname));
     // this is passes a TypeDesc to an LLVM op-code
     args.push_back (rop.ll.constant((int) Data.typespec().simpletype().basetype));
@@ -2665,8 +2836,11 @@ LLVMGEN (llvm_gen_gettextureinfo)
     // destination
     args.push_back (rop.llvm_void_ptr (Data));
 
-    llvm::Value *r = rop.ll.call_function ("osl_get_textureinfo", &args[0], args.size());
+    llvm::Value *r = rop.ll.call_function ("osl_get_textureinfo", args);
     rop.llvm_store_value (r, Result);
+    /* Do not leave derivs uninitialized */
+    if (Data.has_derivs())
+        rop.llvm_zero_derivs (Data);
 
     return true;
 }
@@ -2713,7 +2887,7 @@ LLVMGEN (llvm_gen_getmessage)
     args[7] = rop.ll.constant(op.sourcefile());
     args[8] = rop.ll.constant(op.sourceline());
 
-    llvm::Value *r = rop.ll.call_function ("osl_getmessage", args, 9);
+    llvm::Value *r = rop.ll.call_function ("osl_getmessage", args);
     rop.llvm_store_value (r, Result);
     return true;
 }
@@ -2747,7 +2921,7 @@ LLVMGEN (llvm_gen_setmessage)
     args[5] = rop.ll.constant(op.sourcefile());
     args[6] = rop.ll.constant(op.sourceline());
 
-    rop.ll.call_function ("osl_setmessage", args, 7);
+    rop.ll.call_function ("osl_setmessage", args);
     return true;
 }
 
@@ -2790,7 +2964,7 @@ LLVMGEN (llvm_gen_calculatenormal)
     args.push_back (rop.llvm_void_ptr (Result));
     args.push_back (rop.sg_void_ptr());
     args.push_back (rop.llvm_void_ptr (P));
-    rop.ll.call_function ("osl_calculatenormal", &args[0], args.size());
+    rop.ll.call_function ("osl_calculatenormal", args);
     if (Result.has_derivs())
         rop.llvm_zero_derivs (Result);
     return true;
@@ -2879,7 +3053,7 @@ LLVMGEN (llvm_gen_spline)
     else
         args.push_back (rop.ll.constant ((int)Knots.typespec().arraylength()));
     args.push_back (rop.ll.constant ((int)Knots.typespec().arraylength()));
-    rop.ll.call_function (name.c_str(), &args[0], args.size());
+    rop.ll.call_function (name.c_str(), args);
 
     if (Result.has_derivs() && !result_derivs)
         rop.llvm_zero_derivs (Result);
@@ -2890,7 +3064,7 @@ LLVMGEN (llvm_gen_spline)
 
 
 static void
-llvm_gen_keyword_fill(BackendLLVM &rop, Opcode &op, const ClosureRegistry::ClosureEntry *clentry, ustring clname, llvm::Value *attr_p, int argsoffset)
+llvm_gen_keyword_fill(BackendLLVM &rop, Opcode &op, const ClosureRegistry::ClosureEntry *clentry, ustring clname, llvm::Value *mem_void_ptr, int argsoffset)
 {
     DASSERT(((op.nargs() - argsoffset) % 2) == 0);
 
@@ -2908,25 +3082,23 @@ llvm_gen_keyword_fill(BackendLLVM &rop, Opcode &op, const ClosureRegistry::Closu
         bool legal = false;
         // Make sure there is some keyword arg that has the name and the type
         for (int t = 0; t < clentry->nkeyword; ++t) {
-            const ClosureParam &param = clentry->params[clentry->nformal + t];
+            const ClosureParam &p = clentry->params[clentry->nformal + t];
             // strcmp might be too much, we could precompute the ustring for the param,
             // but in this part of the code is not a big deal
-            if (param.type == ValueType && !strcmp(key->c_str(), param.key))
+            if (equivalent(p.type,ValueType) && !strcmp(key->c_str(), p.key)) {
+            	// store data
+            	DASSERT(p.offset + p.field_size <= clentry->struct_size);
+                llvm::Value* dst = rop.ll.offset_ptr (mem_void_ptr, p.offset);
+                llvm::Value* src = rop.llvm_void_ptr (Value);
+                rop.ll.op_memcpy (dst, src, (int)p.type.size(),
+                					4 /* use 4 byte alignment for now */);
                 legal = true;
+                break;
+            }
         }
         if (!legal) {
-            rop.shadingsys().warning("Unsupported closure keyword arg \"%s\" for %s (%s:%d)", key->c_str(), clname.c_str(), op.sourcefile().c_str(), op.sourceline());
-            continue;
+            rop.shadingcontext()->warning("Unsupported closure keyword arg \"%s\" for %s (%s:%d)", key->c_str(), clname.c_str(), op.sourcefile().c_str(), op.sourceline());
         }
-
-        llvm::Value *key_to     = rop.ll.GEP (attr_p, attr_i, 0);
-        llvm::Value *key_const  = rop.ll.constant_ptr(*((void **)key), rop.ll.type_string());
-        llvm::Value *value_to   = rop.ll.GEP (attr_p, attr_i, 1);
-        llvm::Value *value_from = rop.llvm_void_ptr (Value);
-        value_to = rop.ll.ptr_cast (value_to, rop.ll.type_void_ptr());
-
-        rop.ll.op_store (key_const, key_to);
-        rop.ll.op_memcpy (value_to, value_from, (int)ValueType.size(), 4);
     }
 }
 
@@ -2947,13 +3119,14 @@ LLVMGEN (llvm_gen_closure)
 
     const ClosureRegistry::ClosureEntry * clentry = rop.shadingsys().find_closure(closure_name);
     if (!clentry) {
-        rop.shadingsys().error ("Closure '%s' is not supported by the current renderer, called from (%s:%d)",
-                                closure_name.c_str(), op.sourcefile().c_str(), op.sourceline());
+        rop.llvm_gen_error (Strutil::format("Closure '%s' is not supported by the current renderer, called from %s:%d in shader \"%s\", layer %d \"%s\", group \"%s\"",
+                                     closure_name, op.sourcefile(), op.sourceline(),
+                                     rop.inst()->shadername(), rop.layer(),
+                                     rop.inst()->layername(), rop.group().name()));
         return false;
     }
 
     ASSERT (op.nargs() >= (2 + weighted + clentry->nformal));
-    int nattrs = (op.nargs() - (2 + weighted + clentry->nformal)) / 2;
 
     // Call osl_allocate_closure_component(closure, id, size).  It returns
     // the memory for the closure parameter data.
@@ -2961,12 +3134,12 @@ LLVMGEN (llvm_gen_closure)
     llvm::Value *sg_ptr = rop.sg_void_ptr();
     llvm::Value *id_int = rop.ll.constant(clentry->id);
     llvm::Value *size_int = rop.ll.constant(clentry->struct_size);
-    llvm::Value *nattrs_int = rop.ll.constant(nattrs);
-    llvm::Value *alloc_args[5] = { sg_ptr, id_int, size_int, nattrs_int,
-                                   weighted ? rop.llvm_void_ptr(*weight) : NULL };
+    std::vector<llvm::Value *> alloc_args { sg_ptr, id_int, size_int };
+    if (weighted)
+        alloc_args.push_back (rop.llvm_void_ptr(*weight));
     llvm::Value *return_ptr = weighted ?
-          rop.ll.call_function ("osl_allocate_weighted_closure_component", alloc_args, 5)
-        : rop.ll.call_function ("osl_allocate_closure_component", alloc_args, 4);
+          rop.ll.call_function ("osl_allocate_weighted_closure_component", alloc_args)
+        : rop.ll.call_function ("osl_allocate_closure_component", alloc_args);
     llvm::Value *comp_void_ptr = return_ptr;
 
     // For the weighted closures, we need a surrounding "if" so that it's safe
@@ -2983,8 +3156,8 @@ LLVMGEN (llvm_gen_closure)
     }
 
     llvm::Value *comp_ptr = rop.ll.ptr_cast(comp_void_ptr, rop.llvm_type_closure_component_ptr());
-    // Get the address of the primitive buffer, which is the 5th field
-    llvm::Value *mem_void_ptr = rop.ll.GEP (comp_ptr, 0, 5);
+    // Get the address of the primitive buffer, which is the 2nd field
+    llvm::Value *mem_void_ptr = rop.ll.GEP (comp_ptr, 0, 2);
     mem_void_ptr = rop.ll.ptr_cast(mem_void_ptr, rop.ll.type_void_ptr());
 
     // If the closure has a "prepare" method, call
@@ -2994,7 +3167,7 @@ LLVMGEN (llvm_gen_closure)
         // Call clentry->prepare(renderservices *, int id, void *mem)
         llvm::Value *funct_ptr = rop.ll.constant_ptr((void *)clentry->prepare, rop.llvm_type_prepare_closure_func());
         llvm::Value *args[3] = {render_ptr, id_int, mem_void_ptr};
-        rop.ll.call_function (funct_ptr, args, 3);
+        rop.ll.call_function (funct_ptr, args);
     } else {
         rop.ll.op_memset (mem_void_ptr, 0, clentry->struct_size, 4 /*align*/);
     }
@@ -3003,19 +3176,20 @@ LLVMGEN (llvm_gen_closure)
     for (int carg = 0; carg < clentry->nformal; ++carg) {
         const ClosureParam &p = clentry->params[carg];
         if (p.key != NULL) break;
-        ASSERT(p.offset < clentry->struct_size);
+        DASSERT(p.offset + p.field_size <= clentry->struct_size);
         Symbol &sym = *rop.opargsym (op, carg + 2 + weighted);
         TypeDesc t = sym.typespec().simpletype();
-        if (t.vecsemantics == TypeDesc::NORMAL || t.vecsemantics == TypeDesc::POINT)
-            t.vecsemantics = TypeDesc::VECTOR;
-        if (!sym.typespec().is_closure_array() && !sym.typespec().is_structure() && t == p.type) {
+        if (!sym.typespec().is_closure_array() && !sym.typespec().is_structure()
+            && equivalent(t,p.type)) {
             llvm::Value* dst = rop.ll.offset_ptr (mem_void_ptr, p.offset);
             llvm::Value* src = rop.llvm_void_ptr (sym);
             rop.ll.op_memcpy (dst, src, (int)p.type.size(),
                              4 /* use 4 byte alignment for now */);
         } else {
-            rop.shadingsys().error ("Incompatible formal argument %d to '%s' closure. Prototypes don't match renderer registry.",
-                                    carg + 1, closure_name.c_str());
+            rop.shadingcontext()->error ("Incompatible formal argument %d to '%s' closure (%s %s, expected %s). Prototypes don't match renderer registry (%s:%d).",
+                                         carg + 1, closure_name,
+                                         sym.typespec().c_str(), sym.name(), p.type,
+                                         op.sourcefile(), op.sourceline());
         }
     }
 
@@ -3025,12 +3199,10 @@ LLVMGEN (llvm_gen_closure)
         // Call clentry->setup(renderservices *, int id, void *mem)
         llvm::Value *funct_ptr = rop.ll.constant_ptr((void *)clentry->setup, rop.llvm_type_setup_closure_func());
         llvm::Value *args[3] = {render_ptr, id_int, mem_void_ptr};
-        rop.ll.call_function (funct_ptr, args, 3);
+        rop.ll.call_function (funct_ptr, args);
     }
 
-    llvm::Value *attrs_void_ptr = rop.ll.offset_ptr (mem_void_ptr, clentry->struct_size);
-    llvm::Value *attrs_ptr = rop.ll.ptr_cast(attrs_void_ptr, rop.llvm_type_closure_component_attr_ptr());
-    llvm_gen_keyword_fill(rop, op, clentry, closure_name, attrs_ptr,
+    llvm_gen_keyword_fill(rop, op, clentry, closure_name, mem_void_ptr,
                           2 + weighted + clentry->nformal);
 
     if (next_block)
@@ -3132,7 +3304,7 @@ LLVMGEN (llvm_gen_pointcloud_search)
     // N.B. the op_branch sets sizeok_block as the new insert point
 
     // non-error code case
-    llvm::Value *count = rop.ll.call_function ("osl_pointcloud_search", &args[0], args.size());
+    llvm::Value *count = rop.ll.call_function ("osl_pointcloud_search", args);
     // Clear derivs if necessary
     for (size_t i = 0; i < clear_derivs_of.size(); ++i)
         rop.llvm_zero_derivs (*clear_derivs_of[i], count);
@@ -3148,7 +3320,7 @@ LLVMGEN (llvm_gen_pointcloud_search)
     args.push_back (rop.ll.constant_ptr ((void *)errorfmt.c_str()));
     args.push_back (rop.ll.constant_ptr ((void *)op.sourcefile().c_str()));
     args.push_back (rop.ll.constant (op.sourceline()));
-    rop.ll.call_function ("osl_error", &args[0], args.size());
+    rop.ll.call_function ("osl_error", args);
 
     rop.ll.op_branch (after_block);
     return true;
@@ -3193,7 +3365,7 @@ LLVMGEN (llvm_gen_pointcloud_get)
     args.push_back (rop.llvm_load_value (Attr_name));
     args.push_back (rop.ll.constant (Data.typespec().simpletype()));
     args.push_back (rop.llvm_void_ptr (Data));
-    llvm::Value *found = rop.ll.call_function ("osl_pointcloud_get", &args[0], args.size());
+    llvm::Value *found = rop.ll.call_function ("osl_pointcloud_get", args);
     rop.llvm_store_value (found, Result);
     if (Data.has_derivs())
         rop.llvm_zero_derivs (Data, count);
@@ -3207,7 +3379,7 @@ LLVMGEN (llvm_gen_pointcloud_get)
     args.push_back (rop.ll.constant_ptr ((void *)errorfmt.c_str()));
     args.push_back (rop.ll.constant_ptr ((void *)op.sourcefile().c_str()));
     args.push_back (rop.ll.constant (op.sourceline()));
-    rop.ll.call_function ("osl_error", &args[0], args.size());
+    rop.ll.call_function ("osl_error", args);
 
     rop.ll.op_branch (after_block);
     return true;
@@ -3248,7 +3420,7 @@ LLVMGEN (llvm_gen_pointcloud_write)
             rop.ll.constant (valsym->typespec().simpletype()), // type[i]
             rop.llvm_void_ptr (*valsym)  // value[i]
         };
-        rop.ll.call_function ("osl_pointcloud_write_helper", &args[0], 7);
+        rop.ll.call_function ("osl_pointcloud_write_helper", args);
     }
 
     llvm::Value * args[7] = {
@@ -3260,7 +3432,7 @@ LLVMGEN (llvm_gen_pointcloud_write)
         rop.ll.void_ptr (types),   // attribute types array
         rop.ll.void_ptr (values)   // attribute values array
     };
-    llvm::Value *ret = rop.ll.call_function ("osl_pointcloud_write", &args[0], 7);
+    llvm::Value *ret = rop.ll.call_function ("osl_pointcloud_write", args);
     rop.llvm_store_value (ret, Result);
 
     return true;
@@ -3287,7 +3459,7 @@ LLVMGEN (llvm_gen_dict_find)
     args[1] = rop.llvm_load_value(Source);
     args[2] = rop.llvm_load_value (Query);
     const char *func = sourceint ? "osl_dict_find_iis" : "osl_dict_find_iss";
-    llvm::Value *ret = rop.ll.call_function (func, &args[0], 3);
+    llvm::Value *ret = rop.ll.call_function (func, args);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3303,8 +3475,8 @@ LLVMGEN (llvm_gen_dict_next)
     Symbol& NodeID = *rop.opargsym (op, 1);
     DASSERT (Result.typespec().is_int() && NodeID.typespec().is_int());
     llvm::Value *ret = rop.ll.call_function ("osl_dict_next",
-                                               rop.sg_void_ptr(),
-                                               rop.llvm_load_value(NodeID));
+                                             rop.sg_void_ptr(),
+                                             rop.llvm_load_value(NodeID));
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3333,7 +3505,7 @@ LLVMGEN (llvm_gen_dict_value)
     args[3] = rop.ll.constant(Value.typespec().simpletype());
     // arg 4: pointer to Value
     args[4] = rop.llvm_void_ptr (Value);
-    llvm::Value *ret = rop.ll.call_function ("osl_dict_value", &args[0], 5);
+    llvm::Value *ret = rop.ll.call_function ("osl_dict_value", args);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3370,7 +3542,7 @@ LLVMGEN (llvm_gen_split)
         args[3] = rop.ll.constant (Results.typespec().arraylength());
     }
     args[4] = rop.ll.constant (Results.typespec().arraylength());
-    llvm::Value *ret = rop.ll.call_function ("osl_split", &args[0], 5);
+    llvm::Value *ret = rop.ll.call_function ("osl_split", args);
     rop.llvm_store_value (ret, R);
     return true;
 }
@@ -3396,7 +3568,7 @@ LLVMGEN (llvm_gen_raytype)
         args[1] = rop.llvm_get_pointer (Name);
         func = "osl_raytype_name";
     }
-    llvm::Value *ret = rop.ll.call_function (func, args, 2);
+    llvm::Value *ret = rop.ll.call_function (func, args);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3415,7 +3587,7 @@ LLVMGEN (llvm_gen_blackbody)
 
     llvm::Value* args[3] = { rop.sg_void_ptr(), rop.llvm_void_ptr(Result),
                              rop.llvm_load_value(Temperature) };
-    rop.ll.call_function (Strutil::format("osl_%s_vf",op.opname().c_str()).c_str(), args, 3);
+    rop.ll.call_function (Strutil::format("osl_%s_vf",op.opname()), args);
 
     // Punt, zero out derivs.
     // FIXME -- only of some day, someone truly needs blackbody() to
@@ -3440,12 +3612,23 @@ LLVMGEN (llvm_gen_luminance)
     bool deriv = C.has_derivs() && Result.has_derivs();
     llvm::Value* args[3] = { rop.sg_void_ptr(), rop.llvm_void_ptr(Result),
                              rop.llvm_void_ptr(C) };
-    rop.ll.call_function (deriv ? "osl_luminance_dfdv" : "osl_luminance_fv",
-                            args, 3);
-
+    rop.ll.call_function (deriv ? "osl_luminance_dfdv" : "osl_luminance_fv", args);
     if (Result.has_derivs() && !C.has_derivs())
         rop.llvm_zero_derivs (Result);
 
+    return true;
+}
+
+
+
+LLVMGEN (llvm_gen_isconstant)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    ASSERT (op.nargs() == 2);
+    Symbol &Result (*rop.opargsym (op, 0));
+    ASSERT (Result.typespec().is_int());
+    Symbol &A (*rop.opargsym (op, 1));
+    rop.llvm_store_value (rop.ll.constant(A.is_constant() ? 1 : 0), Result);
     return true;
 }
 

@@ -50,6 +50,10 @@ static ustring u_nop    ("nop"),
                u_sub    ("sub"),
                u_mul    ("mul"),
                u_if     ("if"),
+               u_for    ("for"),
+               u_while  ("while"),
+               u_dowhile("dowhile"),
+               u_functioncall ("functioncall"),
                u_break ("break"),
                u_continue ("continue"),
                u_return ("return"),
@@ -58,7 +62,8 @@ static ustring u_nop    ("nop"),
                u_pointcloud_write ("pointcloud_write"),
                u_isconnected ("isconnected"),
                u_setmessage ("setmessage"),
-               u_getmessage ("getmessage");
+               u_getmessage ("getmessage"),
+               u_getattribute ("getattribute");
 
 
 OSL_NAMESPACE_ENTER
@@ -118,7 +123,9 @@ RuntimeOptimizer::RuntimeOptimizer (ShadingSystemImpl &shadingsys,
       m_opt_middleman(shadingsys.m_opt_middleman),
       m_pass(0),
       m_next_newconst(0), m_next_newtemp(0),
-      m_stat_opt_locking_time(0), m_stat_specialization_time(0)
+      m_stat_opt_locking_time(0), m_stat_specialization_time(0),
+      m_stop_optimizing(false),
+      m_raytypes_on(0), m_raytypes_off(0)
 {
     memset (&m_shaderglobals, 0, sizeof(ShaderGlobals));
     m_shaderglobals.context = shadingcontext();
@@ -151,6 +158,7 @@ RuntimeOptimizer::set_inst (int newlayer)
     m_symbol_aliases.clear ();
     m_block_aliases.clear ();
     m_param_aliases.clear ();
+    m_bblockids.clear ();
 }
 
 
@@ -161,18 +169,20 @@ OSOProcessorBase::set_debug ()
     // start with the shading system's idea of debugging level
     m_debug = shadingsys().debug();
 
+    // If either group or layer was specified for debug, surely they want
+    // debugging turned on.
+    if (shadingsys().debug_groupname() || shadingsys().debug_layername())
+        m_debug = std::max (m_debug, 1);
+
     // Force debugging off if a specific group was selected for debug
-    // and we're not it.
-    if (shadingsys().debug_groupname() &&
-        shadingsys().debug_groupname() != group().name()) {
+    // and we're not it, or a specific layer was selected for debug and
+    // we're not it.
+    bool wronggroup = (shadingsys().debug_groupname() && 
+                       shadingsys().debug_groupname() != group().name());
+    bool wronglayer = (shadingsys().debug_layername() && inst() &&
+                       shadingsys().debug_layername() != inst()->layername());
+    if (wronggroup || wronglayer)
         m_debug = 0;
-    }
-    // Force debugging off if a specific instance was selected for debug
-    // and we're not currently examining it.
-    if (inst() && shadingsys().debug_layername() &&
-        shadingsys().debug_layername() != inst()->layername()) {
-        m_debug = 0;
-    }
 }
 
 
@@ -230,10 +240,15 @@ RuntimeOptimizer::add_constant (const TypeSpec &type, const void *data,
 {
     int ind = find_constant (type, data);
     if (ind < 0) {
+        // support varlen arrays
+        TypeSpec newtype = type;
+        if (type.is_unsized_array())
+            newtype.make_array (datatype.numelements());
+
         Symbol newconst (ustring::format ("$newconst%d", m_next_newconst++),
-                         type, SymTypeConst);
+                         newtype, SymTypeConst);
         void *newdata;
-        TypeDesc t (type.simpletype());
+        TypeDesc t (newtype.simpletype());
         size_t n = t.aggregate * t.numelements();
         if (datatype == TypeDesc::UNKNOWN)
             datatype = t;
@@ -274,10 +289,7 @@ RuntimeOptimizer::add_constant (const TypeSpec &type, const void *data,
             ASSERT (0 && "unsupported type for add_constant");
         }
         newconst.data (newdata);
-        ASSERT (inst()->symbols().capacity() > inst()->symbols().size() &&
-                "we shouldn't have to realloc here");
-        ind = (int) inst()->symbols().size ();
-        inst()->symbols().push_back (newconst);
+        ind = add_symbol (newconst);
         m_all_consts.push_back (ind);
     }
     return ind;
@@ -288,12 +300,8 @@ RuntimeOptimizer::add_constant (const TypeSpec &type, const void *data,
 int
 RuntimeOptimizer::add_temp (const TypeSpec &type)
 {
-    Symbol newtemp (ustring::format ("$opttemp%d", m_next_newtemp++),
-                    type, SymTypeTemp);
-    ASSERT (inst()->symbols().capacity() > inst()->symbols().size() &&
-            "we shouldn't have to realloc here");
-    inst()->symbols().push_back (newtemp);
-    return (int) inst()->symbols().size()-1;
+    return add_symbol (Symbol (ustring::format ("$opttemp%d", m_next_newtemp++),
+                               type, SymTypeTemp));
 }
 
 
@@ -302,40 +310,99 @@ int
 RuntimeOptimizer::add_global (ustring name, const TypeSpec &type)
 {
     int index = inst()->findsymbol (name);
-    if (index < 0) {
-        Symbol newglobal (name, type, SymTypeGlobal);
-        ASSERT (inst()->symbols().capacity() > inst()->symbols().size() &&
-                "we shouldn't have to realloc here");
-        index = (int) inst()->symbols().size ();
-        inst()->symbols().push_back (newglobal);
-    }
+    if (index < 0)
+        index = add_symbol (Symbol (name, type, SymTypeGlobal));
     return index;
 }
 
 
 
+int
+RuntimeOptimizer::add_symbol (const Symbol &sym)
+{
+    size_t index = inst()->symbols().size ();
+    ASSERT (inst()->symbols().capacity() > index &&
+            "we shouldn't have to realloc here");
+    inst()->symbols().push_back (sym);
+    // Mark the symbol as always read.  Next time we recompute symbol
+    // lifetimes, it'll get the correct range for when it's read and
+    // written.  But for now, just make sure it doesn't accidentally
+    // look entirely unused.
+    inst()->symbols().back().mark_always_used ();
+    return (int) index;
+}
+
+
+
 void
-RuntimeOptimizer::turn_into_new_op (Opcode &op, ustring newop, int newarg1,
-                                    int newarg2, const char *why)
+RuntimeOptimizer::debug_opt_impl (string_view message) const
+{
+    static OIIO::spin_mutex mutex;
+    OIIO::spin_lock lock (mutex);
+    std::cout << message;
+}
+
+
+
+void
+RuntimeOptimizer::debug_opt_ops (int opbegin, int opend, string_view message) const
+{
+    const Opcode &op (inst()->ops()[opbegin]);
+    std::string oprange;
+    if (opbegin >= 0 && opend-opbegin > 1)
+        oprange = Strutil::format ("ops %d-%d ", opbegin, opend);
+    else if (opbegin >= 0)
+        oprange = Strutil::format ("op %d ", opbegin);
+    debug_opt ("%s%s (@ %s:%d)\n", oprange, message,
+               op.sourcefile(), op.sourceline());
+}
+
+
+
+void
+RuntimeOptimizer::debug_turn_into (const Opcode &op, int numops,
+                                   string_view newop,
+                                   int newarg0, int newarg1, int newarg2,
+                                   string_view why)
+{
+    int opnum = &op - &(inst()->ops()[0]);
+    std::string msg;
+    if (numops == 1)
+        msg = Strutil::format ("turned '%s' to '%s", op_string(op), newop);
+    else
+        msg = Strutil::format ("turned to '%s", newop);
+    if (newarg0 >= 0)
+        msg += Strutil::format (" %s", inst()->symbol(newarg0)->name());
+    if (newarg1 >= 0)
+        msg += Strutil::format (" %s", inst()->symbol(newarg1)->name());
+    if (newarg2 >= 0)
+        msg += Strutil::format (" %s", inst()->symbol(newarg2)->name());
+    msg += "'";
+    if (why.size())
+        msg += Strutil::format (" : %s", why);
+    debug_opt_ops (opnum, opnum+numops, msg);
+}
+
+
+
+void
+RuntimeOptimizer::turn_into_new_op (Opcode &op, ustring newop, int newarg0,
+                                    int newarg1, int newarg2, string_view why)
 {
     int opnum = &op - &(inst()->ops()[0]);
     DASSERT (opnum >= 0 && opnum < (int)inst()->ops().size());
     if (debug() > 1)
-        std::cout << "turned op " << opnum
-                  << " from " << op.opname() << " to "
-                  << newop << ' ' << inst()->symbol(newarg1)->name() << ' '
-                  << (newarg2<0 ? "" : inst()->symbol(newarg2)->name().c_str())
-                  << (why ? " : " : "") << (why ? why : "") << "\n";
+        debug_turn_into (op, 1, newop, newarg0, newarg1, newarg2, why);
     op.reset (newop, newarg2<0 ? 2 : 3);
+    inst()->args()[op.firstarg()+0] = newarg0;
     op.argwriteonly (0);
+    opargsym(op, 0)->mark_rw (opnum, false, true);
     inst()->args()[op.firstarg()+1] = newarg1;
-    op.argread (1, true);
-    op.argwrite (1, false);
+    op.argreadonly (1);
     opargsym(op, 1)->mark_rw (opnum, true, false);
     if (newarg2 >= 0) {
         inst()->args()[op.firstarg()+2] = newarg2;
-        op.argread (2, true);
-        op.argwrite (2, false);
+        op.argreadonly (2);
         opargsym(op, 2)->mark_rw (opnum, true, false);
     }
 }
@@ -343,16 +410,12 @@ RuntimeOptimizer::turn_into_new_op (Opcode &op, ustring newop, int newarg1,
 
 
 void
-RuntimeOptimizer::turn_into_assign (Opcode &op, int newarg, const char *why)
+RuntimeOptimizer::turn_into_assign (Opcode &op, int newarg, string_view why)
 {
     // We don't know the op num here, so we subtract the pointers
     int opnum = &op - &(inst()->ops()[0]);
     if (debug() > 1)
-        std::cout << "turned op " << opnum
-                  << " from " << op.opname() << " to "
-                  << opargsym(op,0)->name() << " = " 
-                  << inst()->symbol(newarg)->name()
-                  << (why ? " : " : "") << (why ? why : "") << "\n";
+        debug_turn_into (op, 1, "assign", oparg(op,0), newarg, -1, why);
     op.reset (u_assign, 2);
     inst()->args()[op.firstarg()+1] = newarg;
     op.argwriteonly (0);
@@ -369,7 +432,7 @@ RuntimeOptimizer::turn_into_assign (Opcode &op, int newarg, const char *why)
 
 // Turn the current op into a simple assignment to zero (of the first arg).
 void
-RuntimeOptimizer::turn_into_assign_zero (Opcode &op, const char *why)
+RuntimeOptimizer::turn_into_assign_zero (Opcode &op, string_view why)
 {
     static float zero[16] = { 0, 0, 0, 0,  0, 0, 0, 0,
                               0, 0, 0, 0,  0, 0, 0, 0 };
@@ -382,7 +445,7 @@ RuntimeOptimizer::turn_into_assign_zero (Opcode &op, const char *why)
 
 // Turn the current op into a simple assignment to one (of the first arg).
 void
-RuntimeOptimizer::turn_into_assign_one (Opcode &op, const char *why)
+RuntimeOptimizer::turn_into_assign_one (Opcode &op, string_view why)
 {
     Symbol &R (*(inst()->argsymbol(op.firstarg()+0)));
     if (R.typespec().is_int()) {
@@ -401,13 +464,11 @@ RuntimeOptimizer::turn_into_assign_one (Opcode &op, const char *why)
 
 // Turn the op into a no-op
 int
-RuntimeOptimizer::turn_into_nop (Opcode &op, const char *why)
+RuntimeOptimizer::turn_into_nop (Opcode &op, string_view why)
 {
     if (op.opname() != u_nop) {
         if (debug() > 1)
-            std::cout << "turned op " << (&op - &(inst()->ops()[0]))
-                      << " from " << op.opname() << " to nop"
-                      << (why ? " : " : "") << (why ? why : "") << "\n";
+            debug_turn_into (op, 1, "nop", -1, -1, -1, why);
         op.reset (u_nop, 0);
         return 1;
     }
@@ -417,10 +478,10 @@ RuntimeOptimizer::turn_into_nop (Opcode &op, const char *why)
 
 
 int
-RuntimeOptimizer::turn_into_nop (int begin, int end, const char *why)
+RuntimeOptimizer::turn_into_nop (int begin, int end, string_view why)
 {
     int changed = 0;
-    for (int i = begin;  i != end;  ++i) {
+    for (int i = begin;  i < end;  ++i) {
         Opcode &op (inst()->ops()[i]);
         if (op.opname() != u_nop) {
             op.reset (u_nop, 0);
@@ -428,8 +489,7 @@ RuntimeOptimizer::turn_into_nop (int begin, int end, const char *why)
         }
     }
     if (debug() > 1 && changed)
-        std::cout << "turned ops " << begin << "-" << (end-1) << " into nop"
-                  << (why ? " : " : "") << (why ? why : "") << "\n";
+        debug_turn_into (inst()->ops()[begin], end-begin, "nop", -1, -1, -1, why);
     return changed;
 }
 
@@ -438,7 +498,8 @@ RuntimeOptimizer::turn_into_nop (int begin, int end, const char *why)
 void
 RuntimeOptimizer::insert_code (int opnum, ustring opname,
                                const int *argsbegin, const int *argsend,
-                               bool recompute_rw_ranges, int relation)
+                               RecomputeRWRangesOption recompute_rw_ranges,
+                               InsertRelation relation)
 {
     OpcodeVec &code (inst()->ops());
     std::vector<int> &opargs (inst()->args());
@@ -541,7 +602,8 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
 void
 RuntimeOptimizer::insert_code (int opnum, ustring opname,
                                const std::vector<int> &args_to_add,
-                               bool recompute_rw_ranges, int relation)
+                               RecomputeRWRangesOption recompute_rw_ranges,
+                               InsertRelation relation)
 {
     const int *argsbegin = (args_to_add.size())? &args_to_add[0]: NULL;
     const int *argsend = argsbegin + args_to_add.size();
@@ -553,7 +615,8 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
 
 
 void
-RuntimeOptimizer::insert_code (int opnum, ustring opname, int relation,
+RuntimeOptimizer::insert_code (int opnum, ustring opname,
+                               InsertRelation relation,
                                int arg0, int arg1, int arg2, int arg3)
 {
     int args[4];
@@ -562,7 +625,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname, int relation,
     if (arg1 >= 0) args[nargs++] = arg1;
     if (arg2 >= 0) args[nargs++] = arg2;
     if (arg3 >= 0) args[nargs++] = arg3;
-    insert_code (opnum, opname, args, args+nargs, true, relation);
+    insert_code (opnum, opname, args, args+nargs, RecomputeRWRanges, relation);
 }
 
 
@@ -575,7 +638,8 @@ RuntimeOptimizer::insert_useparam (size_t opnum,
 {
     ASSERT (params_to_use.size() > 0);
     OpcodeVec &code (inst()->ops());
-    insert_code (opnum, u_useparam, params_to_use, 1);
+    insert_code (opnum, u_useparam, params_to_use,
+                 RecomputeRWRanges, GroupWithNext);
 
     // All ops are "read"
     code[opnum].argwrite (0, false);
@@ -676,6 +740,7 @@ RuntimeOptimizer::add_useparam (SymbolPtrVec &allsyms)
 
     // Re-track variable lifetimes, since the inserted useparam
     // instructions will have change the instruction numbers.
+    find_basic_blocks ();
     track_variable_lifetimes (allsyms);
 }
 
@@ -707,6 +772,29 @@ OSOProcessorBase::is_one (const Symbol &A)
         (Atype.is_int() && *(const int *)A.data() == 1) ||
         (Atype.is_triple() && *(const Vec3 *)A.data() == Vone) ||
         (Atype.is_matrix() && *(const Matrix44 *)A.data() == Mone);
+}
+
+
+
+std::string
+OSOProcessorBase::const_value_as_string (const Symbol &A)
+{
+    if (! A.is_constant())
+        return std::string();
+    TypeDesc type (A.typespec().simpletype());
+    int n = type.numelements() * type.aggregate;
+    std::ostringstream s;
+    if (type.basetype == TypeDesc::FLOAT) {
+        for (int i = 0; i < n; ++i)
+            s << (i ? "," : "") << ((const float *)A.data())[i];
+    } else if (type.basetype == TypeDesc::INT) {
+        for (int i = 0; i < n; ++i)
+            s << (i ? "," : "") << ((const int *)A.data())[i];
+    } else if (type.basetype == TypeDesc::STRING) {
+        for (int i = 0; i < n; ++i)
+            s << (i ? "," : "") << '\"' << ((const ustring *)A.data())[i] << '\"';
+    }
+    return s.str();
 }
 
 
@@ -750,25 +838,36 @@ RuntimeOptimizer::simplify_params ()
         Symbol *s (inst()->symbol(i));
         if (s->symtype() != SymTypeParam)
             continue;  // Skip non-params
-                       // FIXME - clever things we can do for OutputParams?
         if (! s->lockgeom())
             continue;  // Don't mess with params that can change with the geom
         if (s->typespec().is_structure() || s->typespec().is_closure_based())
             continue;  // We don't mess with struct placeholders or closures
 
-        if (s->valuesource() == Symbol::InstanceVal ||
-            (s->valuesource() == Symbol::DefaultVal && !s->has_init_ops())) {
-            // Instance value or a plain default value (no init ops) --
-            // turn it into a constant
+        if (s->valuesource() == Symbol::InstanceVal) {
+            // Instance value -- turn it into a constant and remove init ops
             make_symbol_room (1);
             s = inst()->symbol(i);  // In case make_symbol_room changed ptrs
             int cind = add_constant (s->typespec(), s->data());
+            global_alias (i, cind); // Alias this symbol to the new const
+            turn_into_nop (s->initbegin(), s->initend(),
+                           "instance value doesn't need init ops");
+        } else if (s->valuesource() == Symbol::DefaultVal && !s->has_init_ops()) {
+            // Plain default value without init ops -- turn it into a constant
+            make_symbol_room (1);
+            s = inst()->symbol(i);  // In case make_symbol_room changed ptrs
+            int cind = add_constant (s->typespec(), s->data(), s->typespec().simpletype());
             global_alias (i, cind); // Alias this symbol to the new const
         } else if (s->valuesource() == Symbol::DefaultVal && s->has_init_ops()) {
             // Default val comes from init ops -- special cases?  Yes,
             // if it's a simple assignment from a global whose value is
             // not reassigned later, we can just alias it, and if we're
             // lucky that may eliminate all uses of the parameter.
+
+            // First, trim init ops in case nops have accumulated
+            while (s->has_init_ops() && op(s->initbegin()).opname() == u_nop)
+                s->initbegin (s->initbegin()+1);
+            while (s->has_init_ops() && op(s->initend()-1).opname() == u_nop)
+                s->initend (s->initend()-1);
             if (s->initbegin() == s->initend()-1) {  // just one op
                 Opcode &op (inst()->ops()[s->initbegin()]);
                 if (op.opname() == u_assign) {
@@ -798,6 +897,8 @@ RuntimeOptimizer::simplify_params ()
             // It's connected to an earlier layer.  If the output var of
             // the upstream shader is effectively constant or a global,
             // then so is this variable.
+            turn_into_nop (s->initbegin(), s->initend(),
+                           "connected value doesn't need init ops");
             BOOST_FOREACH (Connection &c, inst()->connections()) {
                 if (c.dst.param == i) {
                     // srcsym is the earlier group's output param, which
@@ -817,10 +918,11 @@ RuntimeOptimizer::simplify_params ()
                     f = g.find (srcsym->name());
                     if (f != g.end()) {
                         if (debug() > 1)
-                            std::cout << "Remapping " << inst()->layername()
-                              << "." << s->name() << " because it's connected to "
-                              << uplayer->layername() << "." << srcsym->name()
-                              << ", which is known to be " << f->second << "\n";
+                            debug_opt ("Remapping %s.%s because it's connected to "
+                                       "%s.%s, which is known to be %s\n",
+                                       inst()->layername(), s->name(),
+                                       uplayer->layername(), srcsym->name(),
+                                       f->second);
                         make_symbol_room (1);
                         s = inst()->symbol(i);  // In case make_symbol_room changed ptrs
                         int ind = add_global (f->second, srcsym->typespec());
@@ -881,8 +983,8 @@ RuntimeOptimizer::find_params_holding_globals ()
             continue;   // only interested in global assignments
 
         if (debug() > 1)
-            std::cout << "I think that " << inst()->layername() << "."
-                      << s.name() << " will always be " << src->name() << "\n";
+            debug_opt ("I think that %s.%s will always be %s\n",
+                       inst()->layername(), s.name(), src->name());
         m_params_holding_globals[layer()][s.name()] = src->name();
     }
 }
@@ -1026,6 +1128,23 @@ RuntimeOptimizer::coerce_assigned_constant (Opcode &op)
         return true;
     }
 
+    // turn 'R_matrix = A_float_const' into a matrix const assignment
+    if (A->typespec().is_float() && R->typespec().is_matrix()) {
+        float f = *(float *)A->data();
+        Matrix44 result (f, 0, 0, 0, 0, f, 0, 0, 0, 0, f, 0, 0, 0, 0, f);
+        int cind = add_constant (R->typespec(), &result);
+        turn_into_assign (op, cind, "coerce to correct type");
+        return true;
+    }
+    // turn 'R_matrix = A_int_const' into a matrix const assignment
+    if (A->typespec().is_int() && R->typespec().is_matrix()) {
+        float f = *(int *)A->data();
+        Matrix44 result (f, 0, 0, 0, 0, f, 0, 0, 0, 0, f, 0, 0, 0, 0, f);
+        int cind = add_constant (R->typespec(), &result);
+        turn_into_assign (op, cind, "coerce to correct type");
+        return true;
+    }
+
     return false;
 }
 
@@ -1042,7 +1161,7 @@ RuntimeOptimizer::clear_stale_syms ()
 void
 RuntimeOptimizer::use_stale_sym (int sym)
 {
-    std::map<int,int>::iterator i = m_stale_syms.find(sym);
+    FastIntMap::iterator i = m_stale_syms.find(sym);
     if (i != m_stale_syms.end())
         m_stale_syms.erase (i);
 }
@@ -1072,11 +1191,13 @@ void
 RuntimeOptimizer::simple_sym_assign (int sym, int opnum)
 {
     if (optimize() >= 2 && m_opt_stale_assign) {
-        std::map<int,int>::iterator i = m_stale_syms.find(sym);
+        FastIntMap::iterator i = m_stale_syms.find(sym);
         if (i != m_stale_syms.end()) {
             Opcode &uselessop (inst()->ops()[i->second]);
-            turn_into_nop (uselessop,
-                           debug() > 1 ? Strutil::format("remove stale value assignment to %s, reassigned on op %d", opargsym(uselessop,0)->name().c_str(), opnum).c_str() : "");
+            if (uselessop.opname() != u_nop)
+                turn_into_nop (uselessop,
+                           debug() > 1 ? Strutil::format("remove stale value assignment to %s, reassigned on op %d",
+                                                         opargsym(uselessop,0)->name(), opnum).c_str() : "");
         }
     }
     m_stale_syms[sym] = opnum;
@@ -1101,13 +1222,13 @@ RuntimeOptimizer::unread_after (const Symbol *A, int opnum)
             return false;   // Asked not do do this optimization
         if (A->connected_down())
             return false;   // Connected to something downstream
-        if (shadingsys().is_renderer_output (A->name()))
+        if (A->renderer_output())
             return false;   // This is a renderer output -- don't cull it
     }
 
     // For all else, check if it's either never read at all in this
     // layer or it's only read earlier and we're not part of a loop
-    return !A->everread() || (A->lastread() < opnum && !m_in_loop[opnum]);
+    return !A->everread() || (A->lastread() <= opnum && !m_in_loop[opnum]);
 }
 
 
@@ -1192,12 +1313,13 @@ private:
 /// no longer need; turn it into a a plain old instance-value
 /// parameter.
 void
-RuntimeOptimizer::make_param_use_instanceval (Symbol *R, const char *why)
+RuntimeOptimizer::make_param_use_instanceval (Symbol *R, string_view why)
 {
     if (debug() > 1)
-        std::cout << "Turning " << R->valuesourcename() << ' ' 
-                  << R->name() << " into an instance value "
-                  << (why ? why : "") << "\n";
+        std::cout << "Turning " << R->valuesourcename() << ' '
+                  << R->typespec().c_str() << ' ' << R->name()
+                  << " into an instance value "
+                  << why << "\n";
 
     // Mark its source as the instance value, not connected
     R->valuesource (Symbol::InstanceVal);
@@ -1244,26 +1366,30 @@ RuntimeOptimizer::outparam_assign_elision (int opnum, Opcode &op)
     if (R->symtype() != SymTypeOutputParam)
         return false;    // This logic is only about output params
 
-    /// Check for assignment of output params that are written only once
-    /// in the whole shader -- on this statement -- and assigned a
-    /// constant, and the assignment is unconditional.  In that case,
-    /// just alias it to the constant from here on out.
-    ///
-    /// Furthermore, if nobody READS the output param prior to this
-    /// assignment, let's just change its initial value to the constant
-    /// and get rid of the assignment altogether!
-    if (A->is_constant() && R->typespec() == A->typespec() &&
-            R->firstwrite() == opnum && R->lastwrite() == opnum &&
-            !m_in_conditional[opnum]) {
-        // It's assigned only once, and unconditionally assigned a
-        // constant -- alias it
+    // Check for assignment of output params that are written only once
+    // in the whole shader -- on this statement -- and assigned a
+    // constant, and the assignment is unconditional.  In that case,
+    // just alias it to the constant from here on out.
+    if (// R is being assigned a constant of the right type:
+        A->is_constant() && R->typespec() == A->typespec()
+                // FIXME -- can this be equivalent() rather than == ?
+        // and it's written only on this op, and unconditionally:
+        && R->firstwrite() == opnum && R->lastwrite() == opnum
+        && !m_in_conditional[opnum]
+        // and this is not a case of an init op for an output param that
+        // actually will get an instance value or a connection:
+        && ! ((R->valuesource() == Symbol::InstanceVal || R->connected())
+              && R->initbegin() <= opnum && R->initend() > opnum)
+        ) {
+        // Alias it to the constant it's being assigned
         int cind = inst()->args()[op.firstarg()+1];
         global_alias (inst()->args()[op.firstarg()], cind);
-
-        // If it's also never read before this assignment, just replace its
-        // default value entirely and get rid of the assignment.
-        if (R->firstread() > opnum) {
-            make_param_use_instanceval (R, "- written once, with a constant, before any reads");
+        // If it's also never read before this assignment and isn't a
+        // designated renderer output (which we obviously must write!), just
+        // replace its default value entirely and get rid of the assignment.
+        if (R->firstread() > opnum && ! R->renderer_output() &&
+                m_opt_elide_unconnected_outputs) {
+            make_param_use_instanceval (R, Strutil::format("- written once, with a constant (%s), before any reads", const_value_as_string(*A)));
             replace_param_value (R, A->data(), A->typespec());
             turn_into_nop (op, debug() > 1 ? Strutil::format("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
             return true;
@@ -1272,7 +1398,8 @@ RuntimeOptimizer::outparam_assign_elision (int opnum, Opcode &op)
 
     // If the output param will neither be read later in the shader nor
     // connected to a downstream layer, then we don't really need this
-    // assignment at all.
+    // assignment at all. Note that unread_after() does take into
+    // consideration whether it's a renderer output.
     if (unread_after(R,opnum)) {
         turn_into_nop (op, debug() > 1 ? Strutil::format("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
         return true;
@@ -1327,7 +1454,7 @@ RuntimeOptimizer::dealias_symbol (int symindex, int opnum)
             symindex = i;
             continue;
         }
-        std::map<int,int>::const_iterator found;
+        FastIntMap::const_iterator found;
         found = m_symbol_aliases.find (symindex);
         if (found != m_symbol_aliases.end()) {
             // permanent alias for the sym
@@ -1349,15 +1476,30 @@ RuntimeOptimizer::dealias_symbol (int symindex, int opnum)
 
 
 
+void
+RuntimeOptimizer::block_unalias (int symindex)
+{
+    FastIntMap::iterator i = m_block_aliases.find (symindex);
+    if (i != m_block_aliases.end())
+        i->second = -1;
+    // In addition to the current block_aliases, unalias from any
+    // saved alias lists.
+    for (size_t s = 0, send = m_block_aliases_stack.size(); s < send; ++s) {
+        FastIntMap::iterator i = m_block_aliases_stack[s]->find (symindex);
+        if (i != m_block_aliases_stack[s]->end())
+            i->second = -1;
+    }
+}
+
+
+
 /// Make sure there's room for at least one more symbol, so that we can
 /// add a const if we need to, without worrying about the addresses of
-/// symbols changing if we add a new one soon.  We need an extra
-/// entry for block_aliases, too.
+/// symbols changing if we add a new one soon.
 void
 RuntimeOptimizer::make_symbol_room (int howmany)
 {
     inst()->make_symbol_room (howmany);
-    m_block_aliases.resize (inst()->symbols().size()+howmany, -1);
 }
 
 
@@ -1384,7 +1526,7 @@ public:
                 return false;   // Asked not to do this optimization
             if (sym.connected_down())
                 return false;   // Connected to something downstream
-            if (m_rop.shadingsys().is_renderer_output (sym.name()))
+            if (sym.renderer_output())
                 return false;   // This is a renderer output
             return (sym.lastuse() < sym.initend());
         }
@@ -1416,17 +1558,9 @@ RuntimeOptimizer::next_block_instruction (int opnum)
 
 
 int
-RuntimeOptimizer::peephole2 (int opnum)
+RuntimeOptimizer::peephole2 (int opnum, int op2num)
 {
     Opcode &op (inst()->ops()[opnum]);
-    if (op.opname() == u_nop)
-        return 0;   // Wasn't a real instruction to start with
-
-    // Find the next instruction
-    int op2num = next_block_instruction (opnum);
-    if (! op2num)
-        return 0;    // Not a next instruction within the same block
-
     Opcode &next (inst()->ops()[op2num]);
 
     // N.B. Some of these transformations may look strange, you may
@@ -1542,6 +1676,10 @@ RuntimeOptimizer::peephole2 (int opnum)
         if (a->firstuse() >= opnum && a->lastuse() <= op2num &&
               (a->symtype() != SymTypeGlobal && a->symtype() != SymTypeOutputParam) &&
               equivalent (a->typespec(), c->typespec())) {
+            if (debug() > 1)
+                debug_opt_ops (opnum, opnum+1,
+                               Strutil::format ("turned '%s %s...' to '%s %s...' as part of daisy-chain",
+                                 op.opname(), a->name(), op.opname(), c->name()));
             inst()->args()[op.firstarg()] = inst()->args()[next.firstarg()];
             c->mark_rw (opnum, false, true);
             // Any time we write to a variable that wasn't written to at
@@ -1596,7 +1734,8 @@ RuntimeOptimizer::peephole2 (int opnum)
                 newargs.push_back (oparg(op,i));
             turn_into_nop (op, "combine closure+mul");
             turn_into_nop (next, "combine closure+mul");
-            insert_code (opnum, u_closure, newargs, true, 1);
+            insert_code (opnum, u_closure, newargs,
+                         RecomputeRWRanges, GroupWithNext);
             if (debug() > 1)
                 std::cout << "op " << opnum << "-" << (op2num) 
                           << " combined closure+mul\n";            
@@ -1615,6 +1754,8 @@ RuntimeOptimizer::peephole2 (int opnum)
 void
 RuntimeOptimizer::mark_outgoing_connections ()
 {
+    ASSERT (! inst()->m_instoverrides.size() &&
+            "don't call this before copy_code_from_master");
     inst()->outgoing_connections (false);
     FOREACH_PARAM (Symbol &s, inst())
         s.connected_down (false);
@@ -1643,13 +1784,13 @@ RuntimeOptimizer::remove_unused_params ()
     // Get rid of unused params' init ops and clear their read/write ranges
     FOREACH_PARAM (Symbol &s, inst()) {
         if (param_never_used(s) && s.has_init_ops()) {
-            turn_into_nop (s.initbegin(), s.initend(),
-                           "remove init ops of unused param");
+            std::string why;
+            if (debug() > 1)
+                why = Strutil::format ("remove init ops of unused param %s %s", s.typespec().c_str(), s.name());
+            turn_into_nop (s.initbegin(), s.initend(), why);
             s.set_initrange (0, 0);
             s.clear_rw();   // mark as totally unused
             ++alterations;
-            if (debug() > 1)
-                std::cout << "Realized that param " << s.name() << " is not needed\n";
         }
     }
 
@@ -1657,6 +1798,21 @@ RuntimeOptimizer::remove_unused_params ()
     erase_if (inst()->connections(), param_never_used);
 
     return alterations;
+}
+
+
+
+void
+RuntimeOptimizer::catalog_symbol_writes (int opbegin, int opend,
+                                         FastIntSet &syms)
+{
+    for (int i = opbegin; i < opend; ++i) {
+        const Opcode &op (inst()->ops()[i]);
+        for (int a = 0, nargs = op.nargs();  a < nargs;  ++a) {
+            if (op.argwrite(a))
+                syms.insert (oparg (op, a));
+        }
+    }
 }
 
 
@@ -1750,7 +1906,7 @@ RuntimeOptimizer::eliminate_middleman ()
                             dsym = downinst->mastersymbol(c.dst.param);
                         const Symbol *usym = upinst->symbol(upstream_symbol);
                         if (! usym)
-                            usym = downinst->mastersymbol(upstream_symbol);
+                            usym = upinst->mastersymbol(upstream_symbol);
                         ASSERT (dsym && usym);
                         std::cout << "Removed " << inst()->layername() << "."
                                   << s.name() << " middleman for " 
@@ -1763,6 +1919,302 @@ RuntimeOptimizer::eliminate_middleman ()
             }
         }
     }
+    return changed;
+}
+
+
+
+int
+RuntimeOptimizer::optimize_assignment (Opcode &op, int opnum)
+{
+    // Various optimizations specific to assignment statements
+    ASSERT (op.opname() == u_assign);
+    int changed = 0;
+    Symbol *R (inst()->argsymbol(op.firstarg()+0));
+    Symbol *A (inst()->argsymbol(op.firstarg()+1));
+    bool R_local_or_tmp = (R->symtype() == SymTypeLocal ||
+                           R->symtype() == SymTypeTemp);
+    if (block_alias(inst()->arg(op.firstarg())) == inst()->arg(op.firstarg()+1) ||
+        block_alias(inst()->arg(op.firstarg()+1)) == inst()->arg(op.firstarg())) {
+        // We're re-assigning something already aliased, skip it
+        turn_into_nop (op, "reassignment of current value (2)");
+        return ++changed;
+    }
+    if (coerce_assigned_constant (op)) {
+        // A may have changed, so we need to reset it
+        A = inst()->argsymbol(op.firstarg()+1);
+        ++changed;
+    }
+    // NOW do assignment constant folding, only after we
+    // have performed all the other transformations that may
+    // turn this op into an assignment.
+    changed += constfold_assign (*this, opnum);
+    if (op.opname() != u_assign) {
+        // The const fold has changed the assignment to something
+        // other than assign (presumably nop), so skip the other
+        // assignment transformations below.
+        return 0;
+    }
+    if ((A->is_constant() || A->lastwrite() < opnum) &&
+        equivalent(R->typespec(), A->typespec())) {
+        // Safe to alias R to A for this block, if A is a
+        // constant or if it's never written to again.
+        block_alias (inst()->arg(op.firstarg()),
+                         inst()->arg(op.firstarg()+1));
+        // std::cerr << opnum << " aliasing " << R->mangled() << " to "
+        //       << inst()->argsymbol(op.firstarg()+1)->mangled() << "\n";
+    }
+    if (A->is_constant() && R->typespec() == A->typespec() &&
+        R_local_or_tmp &&
+        R->firstwrite() == opnum && R->lastwrite() == opnum) {
+        // This local or temp is written only once in the
+        // whole shader -- on this statement -- and it's
+        // assigned a constant.  So just alias it to the
+        // constant.
+        int cind = inst()->args()[op.firstarg()+1];
+        global_alias (inst()->args()[op.firstarg()], cind);
+        turn_into_nop (op, "replace symbol with constant");
+        return ++changed;
+    }
+    if (R_local_or_tmp && ! R->everread()) {
+        // This local is written but NEVER READ.  nop it.
+        turn_into_nop (op, "local/tmp never read");
+        return ++changed;
+    }
+    if (outparam_assign_elision (opnum, op)) {
+        return ++changed;
+    }
+    if (R == A) {
+        // Just an assignment to itself -- turn into NOP!
+        turn_into_nop (op, "self-assignment");
+        return ++changed;
+    } else if (R_local_or_tmp && R->lastread() < opnum
+               && ! m_in_loop[opnum]) {
+        // Don't bother assigning if we never read it again
+        turn_into_nop (op, "symbol never read again");
+        return ++changed;
+    }
+    return changed;
+}
+
+
+
+void
+RuntimeOptimizer::copy_block_aliases (const FastIntMap &old_block_aliases,
+                                      FastIntMap &new_block_aliases,
+                                      const FastIntSet *excluded,
+                                      bool copy_temps)
+{
+    ASSERT (&old_block_aliases != &new_block_aliases &&
+            "copy_block_aliases does not work in-place");
+    // Find all symbols written anywhere in the instruction range
+    new_block_aliases.clear ();
+    new_block_aliases.reserve (old_block_aliases.size());
+    for (FastIntMap::const_iterator alias = old_block_aliases.begin();
+         alias != old_block_aliases.end();  ++alias) {
+        if (alias->second < 0)
+            continue;    // erased alias -- don't copy
+        if (! copy_temps && (inst()->symbol(alias->first)->is_temp() ||
+                             inst()->symbol(alias->second)->is_temp()))
+            continue;    // don't copy temp aliases unless told to
+        if (excluded && (excluded->find(alias->first) != excluded->end() ||
+                         excluded->find(alias->second) != excluded->end()))
+            continue;    // don't copy from excluded list
+        new_block_aliases[alias->first] = alias->second;
+    }
+}
+
+
+
+int
+RuntimeOptimizer::optimize_ops (int beginop, int endop,
+                                FastIntMap *seed_block_aliases)
+{
+    if (beginop >= endop)
+        return 0;
+
+    // Constant aliases valid for just this basic block
+    clear_block_aliases ();
+
+    // Provide a place where, if we recurse, we can save prior block
+    // aliases. Register them on the block_aliases_stack so that calls to
+    // block_unalias() will unalias from there, too.
+    FastIntMap saved_block_aliases;
+    m_block_aliases_stack.push_back (&saved_block_aliases);
+
+    int lastblock = -1;
+    int skipops = 0;   // extra inserted ops to skip over
+    int changed = 0;
+    size_t num_ops = inst()->ops().size();
+    size_t old_num_ops = num_ops;   // track when it changes
+    for (int opnum = beginop;  opnum < endop;  opnum += 1) {
+        ASSERT (old_num_ops == num_ops); // better not happen unknowingly
+        DASSERT (num_ops == inst()->ops().size());
+        DASSERT (size_t(opnum) < inst()->ops().size());
+        if (m_stop_optimizing)
+            break;
+        Opcode *op = &inst()->ops()[opnum];
+        if (skipops) {
+            // If a previous optimization inserted ops and told us
+            // to skip over the new ones, we still need to unalias
+            // any symbols written by this op, but otherwise skip
+            // all subsequent optimizations until we run down the
+            // skipops counter.
+            block_unalias_written_args (*op);
+            ASSERT (lastblock == m_bblockids[opnum] &&
+                    "this should not be a new basic block");
+            --skipops;
+            continue;   // Move along to the next op, no opimization here
+        }
+        // Things to do if we've just moved to a new basic block
+        if (lastblock != m_bblockids[opnum]) {
+            clear_block_aliases (seed_block_aliases);
+            seed_block_aliases = NULL; // only the first time
+            clear_stale_syms ();
+            lastblock = m_bblockids[opnum];
+        }
+        // Things to do at the start of main code:
+        // * Alias output params to their initial values, if known.
+        if (opnum == inst()->m_maincodebegin) {
+            for (int i = inst()->firstparam();  i < inst()->lastparam();  ++i) {
+                Symbol *s (inst()->symbol(i));
+                if (s->symtype() == SymTypeOutputParam && s->lockgeom() &&
+                      (s->valuesource() == Symbol::DefaultVal ||
+                       s->valuesource() == Symbol::InstanceVal) &&
+                      ! s->has_init_ops() &&
+                      ! s->typespec().is_closure_based() &&
+                      ! s->typespec().is_structure_based()) {
+                    make_symbol_room (1);  // Make sure add_constant is ok
+                    s = inst()->symbol(i);
+                    int cind = add_constant (s->typespec(), s->data());
+                    block_alias (i, cind); // Alias this symbol to the new const
+                }
+            }
+        }
+        // Nothing below here to do for no-ops, take early out.
+        if (op->opname() == u_nop)
+            continue;
+        // De-alias the readable args to the op and figure out if
+        // there are any constants involved.
+        for (int i = 0, e = op->nargs();  i < e;  ++i) {
+            if (! op->argwrite(i)) { // Don't de-alias args that are written
+                int argindex = op->firstarg() + i;
+                int argsymindex = dealias_symbol (inst()->arg(argindex), opnum);
+                inst()->args()[argindex] = argsymindex;
+            }
+            if (op->argread(i))
+                use_stale_sym (oparg(*op,i));
+        }
+        // If it's a simple assignment and the lvalue is "stale", go
+        // back and eliminate its last assignment.
+        if (is_simple_assign(*op))
+            simple_sym_assign (oparg (*op, 0), opnum);
+        // Make sure there's room for several more symbols, so that we
+        // can add a few consts if we need to, without worrying about
+        // the addresses of symbols changing when we add a new one below.
+        make_symbol_room (max_new_consts_per_fold);
+        // For various ops that we know how to effectively
+        // constant-fold, dispatch to the appropriate routine.
+        if (optimize() >= 2 && m_opt_constant_fold) {
+            const OpDescriptor *opd = shadingsys().op_descriptor (op->opname());
+            if (opd && opd->folder) {
+                int c = (*opd->folder) (*this, opnum);
+                if (c) {
+                    changed += c;
+                    // Re-check num_ops in case the folder inserted something
+                    num_ops = inst()->ops().size();
+                    skipops = num_ops - old_num_ops;
+                    endop += num_ops - old_num_ops; // adjust how far we loop
+                    old_num_ops = num_ops;
+                    op = &inst()->ops()[opnum];  // in case ops resized
+                }
+            }
+        }
+        // Clear local block aliases for any args that were written
+        // by this op
+        block_unalias_written_args (*op);
+
+        // Now we handle assignments.
+        if (optimize() >= 2 && op->opname() == u_assign && m_opt_assign)
+            changed += optimize_assignment (*op, opnum);
+        if (optimize() >= 2 && m_opt_elide_useless_ops)
+            changed += useless_op_elision (*op, opnum);
+        if (m_stop_optimizing)
+            break;
+        // Peephole optimization involving pair of instructions (the second
+        // instruction will be in the same basic block.
+        if (optimize() >= 2 && m_opt_peephole && op->opname() != u_nop) {
+            // Find the next instruction in the same basic block
+            int op2num = next_block_instruction (opnum);
+            if (op2num) {
+                int c = peephole2 (opnum, op2num);
+                if (c) {
+                    changed += c;
+                    // Re-check num_ops in case the folder inserted something
+                    num_ops = inst()->ops().size();
+                    // skipops = num_ops - old_num_ops;
+                    endop += num_ops - old_num_ops; // adjust how far we loop
+                    old_num_ops = num_ops;
+                    op = &inst()->ops()[opnum];  // in case ops resized
+                }
+            }
+        }
+
+        // Special cases for "if", "functioncall", and loops: Optimize the
+        // sequences of instructions in the bodies recursively in a way that
+        // allows us to be clever about the basic block alias tracking.
+        ustring opname = op->opname();
+        if ((opname == u_if || opname == u_functioncall ||
+             opname == u_for || opname == u_while || opname == u_dowhile)
+              && shadingsys().m_opt_seed_bblock_aliases) {
+            // Find all symbols written anywhere in the instruction range
+            // of the bodies.
+            FastIntSet symwrites;
+            catalog_symbol_writes (opnum+1, op->farthest_jump(), symwrites);
+            // Save the aliases from the basic block we are exiting.
+            // If & function call: save all prior aliases.
+            // Loops: dont save aliases involving syms written in the loop.
+            // Note that for both cases, we don't copy aliases involving
+            // temps, because that breaks our later assumptions (for temp
+            // coalescing) that temp uses never cross basic block boundaries.
+            if (opname == u_if || opname == u_functioncall)
+                copy_block_aliases (m_block_aliases, saved_block_aliases);
+            else
+                copy_block_aliases (m_block_aliases, saved_block_aliases,
+                                    &symwrites);
+            // 'if' has 2 blocks (then, else), function call has just
+            // one (the body), loops have 4 (init, cond, body, incr),
+            int njumps = (opname == u_if) ? 2 : (opname == u_functioncall ? 1 : 4);
+            // Recursively optimize each body block.
+            for (int j = 0; j < njumps; ++j) {
+                changed += optimize_ops (j==0 ? opnum+1 : op->jump(j-1),
+                                         op->jump(j), &saved_block_aliases);
+                op = &inst()->ops()[opnum];  // in case ops resized
+            }
+            // Adjust optimization loop end if any instructions were added
+            num_ops = inst()->ops().size();
+            endop += num_ops - old_num_ops;
+            old_num_ops = num_ops;
+            // Now we can restore the original aliases to seed the basic
+            // block that follows. For if/function, we need to remove all
+            // aliases referencing syms written within the conditional or
+            // function body. For loops, recall that we already excluded
+            // the written syms from the saved_block_aliases.
+            if (opname == u_if || opname == u_functioncall) {
+                FastIntMap restored_aliases;
+                restored_aliases.swap (saved_block_aliases);
+                // catalog again, in case optimizations in those blocks
+                // caused writes that weren't apparent before.
+                catalog_symbol_writes (opnum+1, op->farthest_jump(), symwrites);
+                copy_block_aliases (restored_aliases, saved_block_aliases,
+                                    &symwrites);
+            }
+            seed_block_aliases = &saved_block_aliases;
+            // Get ready to increment to the next instruction
+            opnum = op->farthest_jump() - 1;
+        }
+    }
+    m_block_aliases_stack.pop_back();  // Done with saved_block_aliases
     return changed;
 }
 
@@ -1804,12 +2256,13 @@ RuntimeOptimizer::optimize_instance ()
 
     // Try to fold constants.  We take several passes, until we get to
     // the point that not much is improving.  It rarely goes beyond 3-4
-    // passes, but we have a hard cutoff at 10 just to be sure we don't
+    // passes, but we have a hard cutoff just to be sure we don't
     // ever get into an infinite loop from an unforseen cycle where we
     // end up inadvertently transforming A => B => A => etc.
     int totalchanged = 0;
     int reallydone = 0;   // Force a few passes after we think we're done
-    for (m_pass = 0;  m_pass < 10;  ++m_pass) {
+    int npasses = shadingsys().opt_passes();
+    for (m_pass = 0;  m_pass < npasses;  ++m_pass) {
 
         // Once we've made one pass (and therefore called
         // mark_outgoing_connections), we may notice that the layer is
@@ -1817,12 +2270,16 @@ RuntimeOptimizer::optimize_instance ()
         if (m_pass != 0 && inst()->unused())
             break;
 
+        if (m_stop_optimizing)
+            break;
+
+        if (debug() > 1)
+            debug_opt ("layer %d \"%s\", pass %d:\n",
+                       layer(), inst()->layername(), m_pass);
+
         // Track basic blocks and conditional states
         find_conditionals ();
         find_basic_blocks ();
-
-        // Constant aliases valid for just this basic block
-        clear_block_aliases ();
 
         // Clear local messages for this instance
         m_local_unknown_message_sent = false;
@@ -1833,181 +2290,9 @@ RuntimeOptimizer::optimize_instance ()
         if (m_pass == 0 && optimize() >= 2)
             find_params_holding_globals ();
 
-        int changed = 0;
-        int lastblock = -1;
-        size_t num_ops = inst()->ops().size();
-        int skipops = 0;   // extra inserted ops to skip over
-        for (int opnum = 0;  opnum < (int)num_ops;  opnum += 1) {
-            // Before getting a reference to this op, be sure that a space
-            // is reserved at the end in case a folding routine inserts an
-            // op.  That ensures that the reference won't be invalid.
-            inst()->ops().reserve (num_ops+1);
-            Opcode &op (inst()->ops()[opnum]);
-
-            if (skipops) {
-                // If a previous optimization inserted ops and told us
-                // to skip over the new ones, we still need to unalias
-                // any symbols written by this op, but otherwise skip
-                // all subsequent optimizations until we run down the
-                // skipops counter.
-                block_unalias_written_args (op);
-                ASSERT (lastblock == m_bblockids[opnum] &&
-                        "this should not be a new basic block");
-                --skipops;
-                continue;   // Move along to the next op, no opimization here
-            }
-
-            // Things to do if we've just moved to a new basic block
-            if (lastblock != m_bblockids[opnum]) {
-                clear_block_aliases ();
-                clear_stale_syms ();
-                lastblock = m_bblockids[opnum];
-            }
-
-            // Nothing below here to do for no-ops, take early out.
-            if (op.opname() == u_nop)
-                continue;
-
-            // De-alias the readable args to the op and figure out if
-            // there are any constants involved.
-            for (int i = 0, e = op.nargs();  i < e;  ++i) {
-                if (! op.argwrite(i)) { // Don't de-alias args that are written
-                    int argindex = op.firstarg() + i;
-                    int argsymindex = dealias_symbol (inst()->arg(argindex), opnum);
-                    inst()->args()[argindex] = argsymindex;
-                }
-                if (op.argread(i))
-                    use_stale_sym (oparg(op,i));
-            }
-
-            // If it's a simple assignment and the lvalue is "stale", go
-            // back and eliminate its last assignment.
-            if (is_simple_assign(op))
-                simple_sym_assign (oparg (op, 0), opnum);
-
-            // Make sure there's room for several more symbols, so that we
-            // can add a few consts if we need to, without worrying about
-            // the addresses of symbols changing when we add a new one below.
-            make_symbol_room (max_new_consts_per_fold);
-
-            // For various ops that we know how to effectively
-            // constant-fold, dispatch to the appropriate routine.
-            if (optimize() >= 2 && m_opt_constant_fold) {
-                const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
-                if (opd && opd->folder) {
-                    size_t old_num_ops = inst()->ops().size();
-                    changed += (*opd->folder) (*this, opnum);
-                    // Re-check num_ops in case the folder inserted something
-                    num_ops = inst()->ops().size();
-                    skipops = num_ops - old_num_ops;
-                }
-            }
-
-            // Clear local block aliases for any args that were written
-            // by this op
-            block_unalias_written_args (op);
-
-            // Get rid of an 'if' if it contains no statements to execute
-            if (optimize() >= 2 && op.opname() == u_if &&
-                    m_opt_constant_fold) {
-                int jump = op.farthest_jump ();
-                bool only_nops = true;
-                for (int i = opnum+1;  i < jump && only_nops;  ++i)
-                    only_nops &= (inst()->ops()[i].opname() == u_nop);
-                if (only_nops) {
-                    turn_into_nop (op, "'if' with no body");
-                    changed = 1;
-                    continue;
-                }
-            }
-
-            // Now we handle assignments.
-            if (optimize() >= 2 && op.opname() == u_assign &&
-                    m_opt_assign) {
-                Symbol *R (inst()->argsymbol(op.firstarg()+0));
-                Symbol *A (inst()->argsymbol(op.firstarg()+1));
-                bool R_local_or_tmp = (R->symtype() == SymTypeLocal ||
-                                       R->symtype() == SymTypeTemp);
-
-                if (block_alias(inst()->arg(op.firstarg())) == inst()->arg(op.firstarg()+1) ||
-                    block_alias(inst()->arg(op.firstarg()+1)) == inst()->arg(op.firstarg())) {
-                    // We're re-assigning something already aliased, skip it
-                    turn_into_nop (op, "reassignment of current value (2)");
-                    ++changed;
-                    continue;
-                }
-
-                if (coerce_assigned_constant (op)) {
-                    // A may have changed, so we need to reset it
-                    A = inst()->argsymbol(op.firstarg()+1);
-                    ++changed;
-                }
-
-                // NOW do assignment constant folding, only after we
-                // have performed all the other transformations that may
-                // turn this op into an assignment.
-                changed += constfold_assign (*this, opnum);
-                if (op.opname() != u_assign) {
-                    // The const fold has changed the assignment to something
-                    // other than assign (presumably nop), so skip the other
-                    // assignment transformations below.
-                    continue;
-                }
-
-                if ((A->is_constant() || A->lastwrite() < opnum) &&
-                    equivalent(R->typespec(), A->typespec())) {
-                    // Safe to alias R to A for this block, if A is a
-                    // constant or if it's never written to again.
-                    block_alias (inst()->arg(op.firstarg()),
-                                     inst()->arg(op.firstarg()+1));
-//                  std::cerr << opnum << " aliasing " << R->mangled() << " to "
-//                        << inst()->argsymbol(op.firstarg()+1)->mangled() << "\n";
-                }
-
-                if (A->is_constant() && R->typespec() == A->typespec() &&
-                    R_local_or_tmp &&
-                    R->firstwrite() == opnum && R->lastwrite() == opnum) {
-                    // This local or temp is written only once in the
-                    // whole shader -- on this statement -- and it's
-                    // assigned a constant.  So just alias it to the
-                    // constant.
-                    int cind = inst()->args()[op.firstarg()+1];
-                    global_alias (inst()->args()[op.firstarg()], cind);
-                    turn_into_nop (op, "replace symbol with constant");
-                    ++changed;
-                    continue;
-                }
-                if (R_local_or_tmp && ! R->everread()) {
-                    // This local is written but NEVER READ.  nop it.
-                    turn_into_nop (op, "local/tmp never read");
-                    ++changed;
-                    continue;
-                }
-                if (outparam_assign_elision (opnum, op)) {
-                    ++changed;
-                    continue;
-                }
-                if (R == A) {
-                    // Just an assignment to itself -- turn into NOP!
-                    turn_into_nop (op, "self-assignment");
-                    ++changed;
-                    continue;
-                } else if (R_local_or_tmp && R->lastread() < opnum
-                           && ! m_in_loop[opnum]) {
-                    // Don't bother assigning if we never read it again
-                    turn_into_nop (op, "symbol never read again");
-                    ++changed;
-                    continue;
-                }
-            }
-
-            if (optimize() >= 2 && m_opt_elide_useless_ops)
-                changed += useless_op_elision (op, opnum);
-
-            // Peephole optimization involving pair of instructions
-            if (optimize() >= 2 && m_opt_peephole)
-                changed += peephole2 (opnum);
-        }
+        // Here is the meat of the optimization, where we pass over the
+        // code for this instance and make various transformations.
+        int changed = optimize_ops (0, (int)inst()->ops().size());
 
         // Now that we've rewritten the code, we need to re-track the
         // variable lifetimes.
@@ -2026,7 +2311,8 @@ RuntimeOptimizer::optimize_instance ()
         }
 
         // Elide unconnected parameters that are never read.
-        changed += remove_unused_params ();
+        if (optimize() >= 1)
+            changed += remove_unused_params ();
 
         // FIXME -- we should re-evaluate whether writes_globals() is still
         // true for this layer.
@@ -2080,10 +2366,25 @@ RuntimeOptimizer::resolve_isconnected ()
         if (op.opname() == u_isconnected) {
             inst()->make_symbol_room (1);
             SymbolPtr s = inst()->argsymbol (op.firstarg() + 1);
-            if (s->connected())
-                turn_into_assign_one (op, "resolve isconnected() [1]");
-            else
-                turn_into_assign_zero (op, "resolve isconnected() [0]");
+            while (const StructSpec *structspec = s->typespec().structspec()) {
+                // How to deal with structures -- just change the reference
+                // to the first field in the struct.
+                // FIXME -- if we ever allow separate layer connection of
+                // individual struct members, this will need something more
+                // sophisticated.
+                ASSERT (structspec && structspec->numfields() >= 1);
+                std::string fieldname = (s->name().string() + "." +
+                                         structspec->field(0).name.string());
+                int fieldsymid = inst()->findparam (ustring(fieldname));
+                ASSERT (fieldsymid >= 0);
+                s = inst()->symbol(fieldsymid);
+            }
+            bool upconnected = s->connected();
+            if (!s->lockgeom() && shadingsys().userdata_isconnected())
+                upconnected = true;
+            int val = (upconnected ? 1 : 0) + (s->connected_down() ? 2 : 0);
+            turn_into_assign (op, add_constant(TypeDesc::TypeInt, &val),
+                              "resolve isconnected()");
         }
     }
 }
@@ -2098,8 +2399,11 @@ RuntimeOptimizer::track_variable_lifetimes (const SymbolPtrVec &allsymptrs)
     BOOST_FOREACH (int a, inst()->args())
         oparg_ptrs.push_back (inst()->symbol (a));
 
+    if (m_bblockids.size() != inst()->ops().size())
+        find_basic_blocks ();
+
     OSLCompilerImpl::track_variable_lifetimes (inst()->ops(), oparg_ptrs,
-                                               allsymptrs);
+                                               allsymptrs, &m_bblockids);
 }
 
 
@@ -2219,6 +2523,7 @@ RuntimeOptimizer::track_variable_dependencies ()
     symdeps.clear ();
 
     std::vector<int> read, written;
+    bool forcederivs = shadingsys().force_derivs();
     // Loop over all ops...
     BOOST_FOREACH (Opcode &op, inst()->ops()) {
         // Gather the list of syms read and written by the op.  Reuse the
@@ -2239,12 +2544,16 @@ RuntimeOptimizer::track_variable_dependencies ()
                     add_dependency (symdeps, w, r);
             // If the op takes derivs, make the pseudo-symbol DerivSym
             // depend on those arguments.
-            if (op.argtakesderivs_all()) {
+            if (op.argtakesderivs_all() || forcederivs) {
                 for (int a = 0;  a < op.nargs();  ++a)
-                    if (op.argtakesderivs(a)) {
+                    if (op.argtakesderivs(a) || forcederivs) {
                         Symbol &s (*opargsym (op, a));
                         // Constants can't take derivs
                         if (s.symtype() == SymTypeConst)
+                            continue;
+                        // Non-float types can't take derivs
+                        if (s.typespec().is_closure() ||
+                            s.typespec().simpletype().basetype != TypeDesc::FLOAT)
                             continue;
                         // Careful -- not all globals can take derivs
                         if (s.symtype() == SymTypeGlobal &&
@@ -2420,6 +2729,11 @@ RuntimeOptimizer::coalesce_temporaries ()
 void
 RuntimeOptimizer::post_optimize_instance ()
 {
+    inst()->evaluate_writes_globals_and_userdata_params ();
+
+    if (inst()->unused())
+        return;    // skip the expensive stuff if we're not used anyway
+
     SymbolPtrVec allsymptrs;
     allsymptrs.reserve (inst()->symbols().size());
     BOOST_FOREACH (Symbol &s, inst()->symbols())
@@ -2446,13 +2760,7 @@ RuntimeOptimizer::collapse_syms ()
 
     // Mark our params that feed to later layers, so that unused params
     // that aren't needed downstream can be removed.
-    FOREACH_PARAM (Symbol &s, inst())
-        s.connected_down (false);
-    for (int lay = layer()+1;  lay < group().nlayers();  ++lay) {
-        BOOST_FOREACH (Connection &c, group()[lay]->m_connections)
-            if (c.srclayer == layer())
-                inst()->symbol(c.src.param)->connected_down (true);
-    }
+    mark_outgoing_connections ();
 
     SymbolVec new_symbols;          // buffer for new symbol table
     std::vector<int> symbol_remap;  // mapping of old sym index to new
@@ -2585,48 +2893,155 @@ RuntimeOptimizer::collapse_ops ()
 
 
 
+std::ostream &
+RuntimeOptimizer::printinst (std::ostream &out) const
+{
+    out << "Shader " << inst()->shadername() << "\n";
+    out << (inst()->unused() ? " UNUSED" : "");
+    out << " connections in=" << inst()->nconnections();
+    out << " out=" << inst()->outgoing_connections();
+    out << (inst()->writes_globals() ? " writes_globals" : "");
+    out << (inst()->userdata_params() ? " userdata_params" : "");
+    out << (inst()->run_lazily() ? " run_lazily" : " run_unconditionally");
+    out << (inst()->outgoing_connections() ? " outgoing_connections" : "");
+    out << (inst()->renderer_outputs() ? " renderer_outputs" : "");
+    out << (inst()->writes_globals() ? " writes_globals" : "");
+    out << (inst()->entry_layer() ? " entry_layer" : "");
+    out << (inst()->last_layer() ? " last_layer" : "");
+    out << "\n";
+    out << "  symbols:\n";
+    for (size_t i = 0, e = inst()->symbols().size();  i < e;  ++i)
+        inst()->symbol(i)->print (out, 256);
+#if 0
+    out << "  int consts:\n    ";
+    for (size_t i = 0;  i < inst()->m_iconsts.size();  ++i)
+        out << inst()->m_iconsts[i] << ' ';
+    out << "\n";
+    out << "  float consts:\n    ";
+    for (size_t i = 0;  i < inst()->m_fconsts.size();  ++i)
+        out << inst()->m_fconsts[i] << ' ';
+    out << "\n";
+    out << "  string consts:\n    ";
+    for (size_t i = 0;  i < inst()->m_sconsts.size();  ++i)
+        out << "\"" << Strutil::escape_chars(inst()->m_sconsts[i]) << "\" ";
+    out << "\n";
+#endif
+    out << "  code:\n";
+    for (size_t i = 0, e = inst()->ops().size();  i < e;  ++i) {
+        const Opcode &op (inst()->ops()[i]);
+        if (i == (size_t)inst()->maincodebegin())
+            out << "(main)\n";
+        out << "    " << i << ": " << op.opname();
+        bool allconst = true;
+        for (int a = 0;  a < op.nargs();  ++a) {
+            const Symbol *s (inst()->argsymbol(op.firstarg()+a));
+            out << " " << s->name();
+            if (s->symtype() == SymTypeConst) {
+                out << " (";
+                s->print_vals(out,16);
+                out << ")";
+            }
+            if (op.argread(a))
+                allconst &= s->is_constant();
+        }
+        for (size_t j = 0;  j < Opcode::max_jumps;  ++j)
+            if (op.jump(j) >= 0)
+                out << " " << op.jump(j);
+        out << "\t# ";
+//        out << "    rw " << Strutil::format("%x",op.argread_bits())
+//            << ' ' << op.argwrite_bits();
+        if (op.argtakesderivs_all())
+            out << " %derivs(" << op.argtakesderivs_all() << ") ";
+        if (allconst)
+            out << "  CONST";
+        if (i == 0 || bblockid(i) != bblockid(i-1))
+            out << "  BBLOCK-START";
+        std::string filename = op.sourcefile().string();
+        size_t slash = filename.find_last_of ("/");
+        if (slash != std::string::npos)
+            filename.erase (0, slash+1);
+        if (filename.length())
+            out << "  (" << filename << ":" << op.sourceline() << ")";
+        out << "\n";
+    }
+    if (inst()->nconnections()) {
+        out << "  connections upstream:\n";
+        for (int i = 0, e = inst()->nconnections(); i < e; ++i) {
+            const Connection &c (inst()->connection(i));
+            out << "    " << c.dst.type.c_str() << ' '
+                << inst()->symbol(c.dst.param)->name();
+            if (c.dst.arrayindex >= 0)
+                out << '[' << c.dst.arrayindex << ']';
+            out << " upconnected from layer " << c.srclayer << ' ';
+            const ShaderInstance *up = group()[c.srclayer];
+            out << "(" << up->layername() << ") ";
+            out << "    " << c.src.type.c_str() << ' '
+                << up->symbol(c.src.param)->name();
+            if (c.src.arrayindex >= 0)
+                out << '[' << c.src.arrayindex << ']';
+            out << "\n";
+        }
+    }
+    return out;
+}
+
+
+
 void
 RuntimeOptimizer::run ()
 {
     Timer rop_timer;
     int nlayers = (int) group().nlayers ();
     if (debug())
-        shadingsys().info ("About to optimize shader group %s (%d layers):",
-                           group().name().c_str(), nlayers);
+        shadingcontext()->info ("About to optimize shader group %s (%d layers):",
+                           group().name(), nlayers);
+    if (debug())
+        std::cout << "About to optimize shader group " << group().name() << "\n";
+
+    for (int layer = 0;  layer < nlayers;  ++layer) {
+        set_inst (layer);
+        // These need to happen before merge_instances
+        inst()->copy_code_from_master (group());
+        mark_outgoing_connections();
+    }
+
+    // Inventory the network and print pre-optimized debug info
+    size_t old_nsyms = 0, old_nops = 0;
+    for (int layer = 0;  layer < nlayers;  ++layer) {
+        set_inst (layer);
+        if (debug() /* && optimize() >= 1*/) {
+            find_basic_blocks ();
+            std::cout.flush ();
+            std::cout << "Before optimizing layer " << layer << " \"" 
+                      << inst()->layername() << "\" (ID " << inst()->id() << ") :\n";
+            printinst (std::cout);
+            std::cout << "\n--------------------------------\n" << std::endl;
+        }
+        old_nsyms += inst()->symbols().size();
+        old_nops += inst()->ops().size();
+    }
+
+    if (shadingsys().m_opt_merge_instances == 1)
+        shadingsys().merge_instances (group());
 
     m_params_holding_globals.resize (nlayers);
 
     // Optimize each layer, from first to last
-    size_t old_nsyms = 0, old_nops = 0;
     for (int layer = 0;  layer < nlayers;  ++layer) {
         set_inst (layer);
         if (inst()->unused())
             continue;
-        inst()->copy_code_from_master ();
-        if (debug() && optimize() >= 1) {
-            std::cout.flush ();
-            std::cout << "Before optimizing layer " << layer << " " 
-                      << inst()->layername() 
-                      << ", I get:\n" << inst()->print()
-                      << "\n--------------------------------\n\n";
-            std::cout.flush ();
-        }
-
-        old_nsyms += inst()->symbols().size();
-        old_nops += inst()->ops().size();
-
         // N.B. we need to resolve isconnected() calls before the instance
         // is otherwise optimized, or else isconnected() may not reflect
         // the original connectivity after substitutions are made.
         resolve_isconnected ();
-
         optimize_instance ();
     }
 
     // Optimize each layer again, from last to first (because some
     // optimizations are only apparent when the subsequent shaders have
     // been simplified).
-    for (int layer = nlayers-2;  layer >= 0;  --layer) {
+    for (int layer = nlayers-1;  layer >= 0;  --layer) {
         set_inst (layer);
         if (! inst()->unused())
             optimize_instance ();
@@ -2639,6 +3054,7 @@ RuntimeOptimizer::run ()
         set_inst (layer);
         if (inst()->unused())
             continue;
+        find_basic_blocks ();
         track_variable_dependencies ();
 
         // For our parameters that require derivatives, mark their
@@ -2657,15 +3073,14 @@ RuntimeOptimizer::run ()
     // Post-opt cleanup: add useparam, coalesce temporaries, etc.
     for (int layer = 0;  layer < nlayers;  ++layer) {
         set_inst (layer);
-        if (! inst()->unused())
-            post_optimize_instance ();
+        post_optimize_instance ();
     }
 
     // Last chance to eliminate duplicate instances
     shadingsys().merge_instances (group(), true);
 
     // Get rid of nop instructions and unused symbols.
-    size_t new_nsyms = 0, new_nops = 0;
+    size_t new_nsyms = 0, new_nops = 0, new_deriv_syms = 0;
     for (int layer = 0;  layer < nlayers;  ++layer) {
         set_inst (layer);
         if (inst()->unused())
@@ -2673,18 +3088,115 @@ RuntimeOptimizer::run ()
         if (optimize() >= 1) {
             collapse_syms ();
             collapse_ops ();
-            if (debug()) {
-                track_variable_lifetimes ();
-                std::cout << "After optimizing layer " << layer << " " 
-                          << inst()->layername() << " (" << inst()->id()
-                          << "): \n" << inst()->print() 
-                          << "\n--------------------------------\n\n";
-                std::cout.flush ();
-            }
+        }
+        if (debug() && !inst()->unused()) {
+            track_variable_lifetimes ();
+            std::cout << "After optimizing layer " << layer << " \"" 
+                      << inst()->layername() << "\" (ID " << inst()->id() << ") :\n";
+            printinst (std::cout);
+            std::cout << "\n--------------------------------\n" << std::endl;
         }
         new_nsyms += inst()->symbols().size();
         new_nops += inst()->ops().size();
     }
+
+    m_unknown_textures_needed = false;
+    m_unknown_closures_needed = false;
+    m_unknown_attributes_needed = false;
+    m_textures_needed.clear();
+    m_closures_needed.clear();
+    m_globals_needed.clear();
+    m_userdata_needed.clear();
+    m_attributes_needed.clear();
+    bool does_nothing = true;
+    for (int layer = 0;  layer < nlayers;  ++layer) {
+        set_inst (layer);
+        if (inst()->unused())
+            continue;  // no need to print or gather stats for unused layers
+        FOREACH_SYM (Symbol &s, inst()) {
+            // set the layer numbers
+            s.layer (layer);
+            // Find interpolated parameters
+            if ((s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam)
+                && ! s.lockgeom()) {
+                UserDataNeeded udn (s.name(), s.typespec().simpletype(), s.has_derivs());
+                std::set<UserDataNeeded>::iterator found;
+                found = m_userdata_needed.find (udn);
+                if (found == m_userdata_needed.end())
+                    m_userdata_needed.insert (udn);
+                else if (udn.derivs && ! found->derivs) {
+                    m_userdata_needed.erase (found);
+                    m_userdata_needed.insert (udn);
+                }
+            }
+            // Track which globals the group needs
+            if (s.symtype() == SymTypeGlobal) {
+                m_globals_needed.insert (s.name());
+            }
+            if (s.has_derivs())
+                ++new_deriv_syms;
+        }
+        BOOST_FOREACH (const Opcode &op, inst()->ops()) {
+            const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
+            if (! opd)
+                continue;
+            if (op.opname() != Strings::end && op.opname() != Strings::useparam)
+                does_nothing = false;  // a non-unused layer with a nontrivial op
+            if (opd->flags & OpDescriptor::Tex) {
+                // for all the texture ops, arg 1 is the texture name
+                Symbol *sym = opargsym (op, 1);
+                ASSERT (sym && sym->typespec().is_string());
+                if (sym->is_constant()) {
+                    ustring texname = *(ustring *)sym->data();
+                    m_textures_needed.insert (texname);
+                } else {
+                    m_unknown_textures_needed = true;
+                }
+            }
+            if (op.opname() == u_closure) {
+                // It's either 'closure result weight name' or 'closure result name'
+                Symbol *sym = opargsym (op, 1); // arg 1 is the closure name
+                if (sym && !sym->typespec().is_string())
+                    sym = opargsym (op, 2);
+                ASSERT (sym && sym->typespec().is_string());
+                if (sym->is_constant()) {
+                    ustring closurename = *(ustring *)sym->data();
+                    m_closures_needed.insert (closurename);
+                } else {
+                    m_unknown_closures_needed = true;
+                }
+            } else if (op.opname() == u_getattribute) {
+                Symbol *sym1 = opargsym (op, 1);
+                ASSERT (sym1 && sym1->typespec().is_string());
+                if (sym1->is_constant()) {
+                    if (op.nargs() == 3) {
+                        // getattribute( attributename, result )
+                        m_attributes_needed.insert( AttributeNeeded( *(ustring *)sym1->data() ) );
+                    } else {
+                        ASSERT (op.nargs() == 4 || op.nargs() == 5);
+                        Symbol *sym2 = opargsym (op, 2);
+                        if (sym2->typespec().is_string()) {
+                            // getattribute( scopename, attributename, result ) or
+                            // getattribute( scopename, attributename, arrayindex, result )
+                            if (sym2->is_constant()) {
+                                m_attributes_needed.insert( AttributeNeeded(
+                                    *(ustring *)sym2->data(), *(ustring *)sym1->data()
+                                ) );
+                            } else {
+                                m_unknown_attributes_needed = true;
+                            }
+                        } else {
+                            // getattribute( attributename, arrayindex, result )
+                            m_attributes_needed.insert( AttributeNeeded( *(ustring *)sym1->data() ) );
+                        }
+                    }
+                } else { // sym1 not constant
+                    m_unknown_attributes_needed = true;
+                }
+            }
+        }
+    }
+    group().does_nothing (does_nothing);
 
     m_stat_specialization_time = rop_timer();
     {
@@ -2695,15 +3207,39 @@ RuntimeOptimizer::run ()
         ss.m_stat_preopt_ops += old_nops;
         ss.m_stat_postopt_syms += new_nsyms;
         ss.m_stat_postopt_ops += new_nops;
+        ss.m_stat_syms_with_derivs += new_deriv_syms;
+        if (does_nothing)
+            ss.m_stat_empty_groups += 1;
     }
     if (shadingsys().m_compile_report) {
-        shadingsys().info ("Optimized shader group %s:",
-                           group().name() ? group().name().c_str() : "");
-        shadingsys().info (" spec %1.2fs, New syms %llu/%llu (%5.1f%%), ops %llu/%llu (%5.1f%%)",
+        shadingcontext()->info ("Optimized shader group %s:", group().name());
+        shadingcontext()->info (" spec %1.2fs, New syms %llu/%llu (%5.1f%%), ops %llu/%llu (%5.1f%%)",
               m_stat_specialization_time, new_nsyms, old_nsyms,
               100.0*double((long long)new_nsyms-(long long)old_nsyms)/double(old_nsyms),
               new_nops, old_nops,
               100.0*double((long long)new_nops-(long long)old_nops)/double(old_nops));
+        if (does_nothing)
+            shadingcontext()->info ("Group does nothing");
+        if (m_textures_needed.size()) {
+            shadingcontext()->info ("Group needs textures:");
+            BOOST_FOREACH (ustring f, m_textures_needed)
+                shadingcontext()->info ("    %s", f);
+            if (m_unknown_textures_needed)
+                shadingcontext()->info ("    Also may construct texture names on the fly.");
+        }
+        if (m_userdata_needed.size()) {
+            shadingcontext()->info ("Group potentially needs userdata:");
+            BOOST_FOREACH (UserDataNeeded f, m_userdata_needed)
+                shadingcontext()->info ("    %s %s %s", f.name, f.type,
+                                        f.derivs ? "(derivs)" : "");
+        }
+        if (m_attributes_needed.size()) {
+            shadingcontext()->info ("Group needs attributes:");
+            BOOST_FOREACH (const AttributeNeeded &f, m_attributes_needed)
+                shadingcontext()->info ("    %s %s", f.name, f.scope);
+            if (m_unknown_attributes_needed)
+                shadingcontext()->info ("    Also may construct attribute names on the fly.");
+        }
     }
 }
 

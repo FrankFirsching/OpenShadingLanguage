@@ -42,15 +42,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "osoreader.h"
 
 #undef yylex
-#define yyFlexLexer osoFlexLexer
-#include "FlexLexer.h"
+extern int osolex();
 
 using namespace OSL;
 using namespace OSL::pvt;
 
 void yyerror (const char *err);
 
-#define yylex OSOReader::osolexer->yylex
+#define yylex osolex
 #define reader OSOReader::reader
 
 static TypeSpec current_typespec;
@@ -191,7 +190,11 @@ symbol
                         typespec.make_array ($3);
                     OSOReader::osoreader->symbol ((SymType)$1, typespec, $4);
                 }
-            initial_values_opt hints_opt ENDOFLINE
+            initial_values_opt hints_opt
+                {
+                    OSOReader::osoreader->parameter_done ();
+                }
+            ENDOFLINE
         | ENDOFLINE
         ;
 
@@ -230,6 +233,7 @@ simple_typename
 
 arraylen_opt
         : '[' INT_LITERAL ']'           { $$ = $2; }
+        | '[' ']'                       { $$ = -1; }
         | /* empty */                   { $$ = 0; }
         ;
 
@@ -256,7 +260,16 @@ initial_value
                 }
         | STRING_LITERAL
                 {
-                    OSOReader::osoreader->symdefault ($1);
+                    string_view s ($1);
+                    // remove the quotes
+                    s.remove_prefix(1); s.remove_suffix(1);
+                    std::string unescaped;
+                    if (s.find('\\') != string_view::npos) {
+                        // Only make a new string if we must unescape
+                        unescaped = OIIO::Strutil::unescape_chars(s);
+                        s = string_view(unescaped);
+                    }
+                    OSOReader::osoreader->symdefault (s.c_str());
                     $$ = 0;
                 }
         ;
@@ -318,8 +331,10 @@ hint
         : HINT
                 {
                     OSOReader::osoreader->hint ($1);
+                    $$ = 0;
                 }
         ;
+
 
 %%
 
@@ -328,9 +343,7 @@ hint
 void
 yyerror (const char *err)
 {
-//    oslcompiler->error (oslcompiler->filename(), oslcompiler->lineno(),
-//                        "Syntax error: %s", err);
-    fprintf (stderr, "Error, line %d: %s", 
+    OSOReader::osoreader->errhandler().error ("Error, line %d: %s", 
              OSOReader::osoreader->lineno(), err);
 }
 
@@ -353,6 +366,6 @@ OSL::pvt::osolextype (int lex)
     case STRINGTYPE : return TypeDesc::TypeString;
     case VECTORTYPE : return TypeDesc::TypeVector;
     case VOIDTYPE   : return TypeDesc::NONE;
-    default: return PT_UNKNOWN;
+    default: return TypeDesc::UNKNOWN;
     }
 }

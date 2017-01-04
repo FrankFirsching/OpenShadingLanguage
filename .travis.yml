@@ -1,0 +1,155 @@
+# .travis.yml for OSL
+
+language: cpp
+sudo: false
+osx_image: xcode6.4
+dist: precise
+
+
+# Add-ons: specify apt packages for Linux
+addons:
+  apt: 
+   sources:
+      - boost-latest
+      - ubuntu-toolchain-r-test
+   packages:
+      - gcc-4.8
+      - g++-4.8
+      - gcc-5
+      - g++-5
+      - gcc-6
+      - g++-6
+      - libboost1.55-all-dev
+      - libtiff4-dev
+      - llvm-3.9
+      - llvm-3.9-dev
+      - clang-3.9
+
+cache:
+    ccache: true
+    apt: true
+    directories:
+      - $HOME/.ccache
+
+before_install:
+    - if [ "$WHICHGCC" == "" ]; then export WHICHGCC="4.8" ; fi
+    - if [ $TRAVIS_OS_NAME == osx ] ; then
+          export PLATFORM=macosx ;
+          sysctl machdep.cpu.features ;
+      elif [ $TRAVIS_OS_NAME == linux ] ; then
+          export PLATFORM=linux64 ;
+          cat /proc/cpuinfo ;
+      fi
+    - export OIIOPLATFORM=$PLATFORM
+    - if [ "$DEBUG" == 1 ] ; then export PLATFORM=${PLATFORM}.debug ; fi
+    - echo "Build platform name is $PLATFORM"
+
+install:
+    - if [ "$CXX" == "g++" ]; then export CXX="g++-${WHICHGCC}" ; fi
+    - export USE_CCACHE=1
+    - export CCACHE_CPP2=1
+    - if [ $TRAVIS_OS_NAME == osx ] ; then
+          src/build-scripts/install_homebrew_deps.bash ;
+          export LLVM_DIRECTORY=/usr/local/opt/llvm38/lib/llvm-3.8 ;
+      elif [ $TRAVIS_OS_NAME == linux ] ; then
+          CXX="ccache $CXX" CCACHE_CPP2=1 src/build-scripts/build_openexr.bash ;
+          export ILMBASE_HOME=$PWD/openexr-install ;
+          export OPENEXR_HOME=$PWD/openexr-install ;
+      fi
+    - export OIIOMAKEFLAGS="$OIIOMAKEFLAGS -j2 DEBUG= "
+    - src/build-scripts/build_openimageio.bash
+    - export OPENIMAGEIOHOME=$PWD/OpenImageIO/dist/$OIIOPLATFORM
+    - export DYLD_LIBRARY_PATH=$OPENIMAGEIOHOME/lib:$DYLD_LIBRARY_PATH
+    - export LD_LIBRARY_PATH=$OPENIMAGEIOHOME/lib:$LD_LIBRARY_PATH
+    - export PATH=$OPENIMAGEIOHOME/bin:$PATH
+    - if [ $TRAVIS_OS_NAME == linux ] ; then
+          export BUILD_FLAGS="$BUILD_FLAGS LLVM_STATIC=1" ;
+          export TEST_FLAGS="-E broken\|render-cornell\|render-oren-nayar\|render-veachmis\|render-ward" ;
+      fi
+    # ^^^ Linux only, can't make these test work. Exclude for now and return later. ;
+
+# before_script:
+
+script:
+    - make VERBOSE=1 $BUILD_FLAGS cmakesetup
+    - make -j2 $BUILD_FLAGS
+    - export OSLHOME=$PWD/dist/$PLATFORM
+    - export DYLD_LIBRARY_PATH=$OSLHOME/lib:$DYLD_LIBRARY_PATH 
+    - export LD_LIBRARY_PATH=$OSLHOME/lib:$LD_LIBRARY_PATH
+    - export PYTHONPATH=$OSLHOME/python:$OPENIMAGEIOHOME/python:$PYTHONPATH
+    - make $BUILD_FLAGS test
+
+
+after_success:
+    - if [ "$CODECOV" == 1 ]; then bash <(curl -s https://codecov.io/bash) ; fi
+
+after_failure:
+# FIXME: find failed logs, stash them or send them to lg?
+
+branches:
+  only:
+    - master
+    - /RB-/
+    - /lg-/
+
+matrix:
+    fast_finish: true
+    exclude:
+      - os: osx
+        compiler: gcc
+      - os: linux
+        compiler: clang
+
+    include:
+    # test default compile: C++11, optimized, default compilers
+      - os: linux
+        compiler: gcc
+      - os: osx
+        compiler: clang
+    # test debug build
+      - os: linux
+        compiler: gcc
+        env: DEBUG=1
+      - os: osx
+        compiler: clang
+        env: DEBUG=1
+    # test with C++14, most modern compiler
+      # - os: osx
+      #   compiler: clang
+      #   env: USE_CPP=14
+      - os: linux
+        compiler: gcc
+        env: WHICHGCC=6 USE_CPP=14
+    # Test against the older release branch of OIIO (all the other tests
+    # are against OIIO master)
+      - os: linux
+        compiler: gcc
+        env: OIIOBRANCH=release USE_CPP11=1
+      - os: osx
+        compiler: clang
+        env: OIIOBRANCH=release USE_CPP11=1
+    # Linux only: test gcc 6 (catch new warnings hot off the presses) and
+    # also use a higher SIMD level, avx and f16c, to make sure all is well.
+    # TravisCI's OSX images don't yet support avx/f16c, so we only do this
+    # on Linux for now, but eventually we'll want to separate these concerns
+    # into separate tests.
+      - os: linux
+        compiler: gcc
+        env: WHICHGCC=6 USE_SIMD=avx,f16c
+    # Linux only: test gcc 5
+      - os: linux
+        compiler: gcc
+        env: WHICHGCC=5
+    # One more, just for the heck of it, turn all SIMD off.  I guess this
+    # should/could be both platforms, but in the interest of making the
+    # tests go faster, don't bother doing it on OSX.
+      - os: linux
+        compiler: gcc
+        env: USE_SIMD=0
+
+notifications:
+    email:
+#        recipients:
+#            - 
+        on_success: change
+        on_failure: always

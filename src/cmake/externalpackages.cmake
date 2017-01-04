@@ -1,7 +1,25 @@
 ###########################################################################
 # Find libraries
 
-setup_path (THIRD_PARTY_TOOLS_HOME 
+# When not in VERBOSE mode, try to make things as quiet as possible
+if (NOT VERBOSE)
+    set (Bison_FIND_QUIETLY true)
+    set (Boost_FIND_QUIETLY true)
+    set (Flex_FIND_QUIETLY true)
+    set (LLVM_FIND_QUIETLY true)
+    set (OpenEXR_FIND_QUIETLY true)
+    set (OpenImageIO_FIND_QUIETLY true)
+    set (Partio_FIND_QUIETLY true)
+    set (PkgConfig_FIND_QUIETLY true)
+    set (PugiXML_FIND_QUIETLY TRUE)
+    set (PythonInterp_FIND_QUIETLY true)
+    set (PythonLibs_FIND_QUIETLY true)
+    set (Threads_FIND_QUIETLY true)
+    set (ZLIB_FIND_QUIETLY true)
+endif ()
+
+
+setup_path (THIRD_PARTY_TOOLS_HOME
             "unknown"
             "Location of third party libraries in the external project")
 
@@ -23,7 +41,7 @@ if (THIRD_PARTY_TOOLS_HOME AND EXISTS "${THIRD_PARTY_TOOLS_HOME}")
 endif ()
 
 
-setup_string (SPECIAL_COMPILE_FLAGS "" 
+setup_string (SPECIAL_COMPILE_FLAGS ""
                "Custom compilation flags")
 if (SPECIAL_COMPILE_FLAGS)
     add_definitions (${SPECIAL_COMPILE_FLAGS})
@@ -34,13 +52,22 @@ endif ()
 ###########################################################################
 # IlmBase setup
 
-find_package (IlmBase REQUIRED)
-
-include_directories ("${ILMBASE_INCLUDE_DIR}")
-
-macro (LINK_ILMBASE target)
-    target_link_libraries (${target} ${ILMBASE_LIBRARIES})
-endmacro ()
+find_package (OpenEXR REQUIRED)
+#OpenEXR 2.2 still has problems with importing ImathInt64.h unqualified
+#thus need for ilmbase/OpenEXR
+include_directories ("${OPENEXR_INCLUDE_DIR}"
+                     "${ILMBASE_INCLUDE_DIR}"
+                     "${ILMBASE_INCLUDE_DIR}/OpenEXR")
+if (${OPENEXR_VERSION} VERSION_LESS 2.0.0)
+    # OpenEXR 1.x had weird #include dirctives, this is also necessary:
+    include_directories ("${OPENEXR_INCLUDE_DIR}/OpenEXR")
+else ()
+    add_definitions (-DUSE_OPENEXR_VERSION2=1)
+endif ()
+if (NOT OpenEXR_FIND_QUIETLY)
+    message (STATUS "ILMBASE_INCLUDE_DIR = ${ILMBASE_INCLUDE_DIR}")
+    message (STATUS "ILMBASE_LIBRARIES = ${ILMBASE_LIBRARIES}")
+endif ()
 
 # end IlmBase setup
 ###########################################################################
@@ -49,11 +76,14 @@ endmacro ()
 ###########################################################################
 # Boost setup
 
-message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
+if (NOT Boost_FIND_QUIETLY)
+    message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
+endif ()
 
 if (NOT DEFINED Boost_ADDITIONAL_VERSIONS)
-  set (Boost_ADDITIONAL_VERSIONS "1.54" "1.53" "1.52" "1.51" "1.50"
-                                 "1.49" "1.48" "1.47" "1.46" "1.45" "1.44" 
+  set (Boost_ADDITIONAL_VERSIONS "1.60" "1.59" "1.58" "1.57" "1.56"
+                                 "1.55" "1.54" "1.53" "1.52" "1.51" "1.50"
+                                 "1.49" "1.48" "1.47" "1.46" "1.45" "1.44"
                                  "1.43" "1.43.0" "1.42" "1.42.0")
 endif ()
 if (LINKSTATIC)
@@ -65,17 +95,18 @@ if (BOOST_CUSTOM)
     # N.B. For a custom version, the caller had better set up the variables
     # Boost_VERSION, Boost_INCLUDE_DIRS, Boost_LIBRARY_DIRS, Boost_LIBRARIES.
 else ()
-    set (Boost_COMPONENTS filesystem regex system thread)
-    if (USE_BOOST_WAVE)
-        list (APPEND Boost_COMPONENTS wave)
-    endif ()
-
-    find_package (Boost 1.42 REQUIRED 
+    set (Boost_COMPONENTS filesystem regex system thread wave)
+    find_package (Boost 1.42 REQUIRED
                   COMPONENTS ${Boost_COMPONENTS}
                  )
 endif ()
 
-if (VERBOSE)
+# On Linux, Boost 1.55 and higher seems to need to link against -lrt
+if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND ${Boost_VERSION} GREATER 105499)
+    list (APPEND Boost_LIBRARIES "rt")
+endif ()
+
+if (NOT Boost_FIND_QUIETLY)
     message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
     message (STATUS "Boost found ${Boost_FOUND} ")
     message (STATUS "Boost version      ${Boost_VERSION}")
@@ -86,7 +117,6 @@ endif ()
 
 include_directories (SYSTEM "${Boost_INCLUDE_DIRS}")
 link_directories ("${Boost_LIBRARY_DIRS}")
-add_definitions(-DBOOST_ALL_DYN_LINK)
 
 # end Boost setup
 ###########################################################################
@@ -97,29 +127,13 @@ add_definitions(-DBOOST_ALL_DYN_LINK)
 
 find_package (ZLIB)
 if (USE_PARTIO)
-    find_library (PARTIO_LIBRARIES
-                  NAMES partio
-                  PATHS "${PARTIO_HOME}/lib")
-    find_path (PARTIO_INCLUDE_DIR
-               NAMES Partio.h
-               PATHS "${PARTIO_HOME}/include")
-    if (PARTIO_INCLUDE_DIR AND PARTIO_LIBRARIES)
-        set (PARTIO_FOUND TRUE)
+    find_package (Partio)
+    if (PARTIO_FOUND)
         add_definitions ("-DUSE_PARTIO=1")
         include_directories ("${PARTIO_INCLUDE_DIR}")
-        if (VERBOSE)
-            message (STATUS "Partio include = ${PARTIO_INCLUDE_DIR}")
-            message (STATUS "Partio library = ${PARTIO_LIBRARIES}")
-        endif ()
     else ()
         add_definitions ("-DUSE_PARTIO=0")
-        set (PARTIO_FOUND FALSE)
-        set (PARTIO_LIBRARIES "")
-        message (STATUS "Partio not found")
     endif ()
-else ()
-    set (PARTIO_FOUND FALSE)
-    set (PARTIO_LIBRARIES "")
 endif (USE_PARTIO)
 
 # end GL Extension Wrangler library setup
@@ -143,46 +157,11 @@ endif()
 ###########################################################################
 # LLVM library setup
 
-if(MSVC)
-
-# A convenience variable:
-set(LLVM_ROOT "" CACHE PATH "Root of LLVM install.")
-# A bit of a sanity check:
-if( NOT EXISTS ${LLVM_ROOT}/include/llvm )
-    message(FATAL_ERROR "LLVM_ROOT (${LLVM_ROOT}) is not a valid LLVM install")
-endif()
-# We incorporate the CMake features provided by LLVM:
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${LLVM_ROOT}/share/llvm/cmake")
-include(LLVMConfig)
-# Now set the header and library paths:
-SET( LLVM_INCLUDES ${LLVM_INCLUDE_DIRS} )
-include_directories( ${LLVM_INCLUDE_DIRS} )
-SET( LLVM_LIB_DIR ${LLVM_LIBRARY_DIRS} )
-link_directories( ${LLVM_LIBRARY_DIRS} )
-add_definitions( ${LLVM_DEFINITIONS} )
-# Let's suppose we want to build a JIT compiler with support for
-# binary code (no interpreter):
-llvm_map_components_to_libraries(LLVM_LIBRARY jit native core ipo BitWriter BitReader)
-
-if(LLVM_DEBUG_SUFFIX)
-	set(LLVM_LIBRARY_RELEASE ${LLVM_LIBRARY})
-	set(LLVM_LIBRARY)
-	foreach(lib ${LLVM_LIBRARY_RELEASE})
-		set(modifiedLib debug "${lib}_d" optimized ${lib})
-		list(APPEND LLVM_LIBRARY ${modifiedLib})
-	endforeach()
-endif()
-
-set(LLVM_VERSION ${LLVM_PACKAGE_VERSION})
-
-else()
-# Non Windows
-
 # try to find llvm-config, with a specific version if specified
 if(LLVM_DIRECTORY)
-  FIND_PROGRAM(LLVM_CONFIG llvm-config-${LLVM_VERSION} HINTS "${LLVM_DIRECTORY}/bin" NO_CMAKE_PATH)
+  FIND_PROGRAM(LLVM_CONFIG llvm-config-${LLVM_VERSION} HINTS "${LLVM_DIRECTORY}/bin" NO_DEFAULT_PATH)
   if(NOT LLVM_CONFIG)
-    FIND_PROGRAM(LLVM_CONFIG llvm-config HINTS "${LLVM_DIRECTORY}/bin" NO_CMAKE_PATH)
+    FIND_PROGRAM(LLVM_CONFIG llvm-config HINTS "${LLVM_DIRECTORY}/bin" NO_DEFAULT_PATH)
   endif()
 else()
   FIND_PROGRAM(LLVM_CONFIG llvm-config-${LLVM_VERSION})
@@ -206,17 +185,34 @@ if(NOT LLVM_DIRECTORY OR EXISTS ${LLVM_CONFIG})
        OUTPUT_STRIP_TRAILING_WHITESPACE)
 endif()
 
+if (LLVM_VERSION VERSION_GREATER 3.4.9 AND (USE_CPP VERSION_LESS 11))
+    message (FATAL_ERROR "LLVM ${LLVM_VERSION} requires C++11. You must build with USE_CPP=11.")
+endif ()
+
 find_library ( LLVM_LIBRARY
                NAMES LLVM-${LLVM_VERSION}
                PATHS ${LLVM_LIB_DIR})
-endif() # Windows/Linux branch
+find_library ( LLVM_MCJIT_LIBRARY
+               NAMES LLVMMCJIT
+               PATHS ${LLVM_LIB_DIR})
+execute_process (COMMAND ${LLVM_CONFIG} --ldflags
+                 OUTPUT_VARIABLE LLVM_LDFLAGS
+                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-if (VERBOSE)
+# if (NOT LLVM_LIBRARY)
+#     execute_process (COMMAND ${LLVM_CONFIG} --libfiles engine
+#                      OUTPUT_VARIABLE LLVM_LIBRARIES
+#                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+# endif ()
+
+if (NOT LLVM_FIND_QUIETLY)
     message (STATUS "LLVM version  = ${LLVM_VERSION}")
     message (STATUS "LLVM dir      = ${LLVM_DIRECTORY}")
     message (STATUS "LLVM includes = ${LLVM_INCLUDES}")
     message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
+    message (STATUS "LLVM MCJIT library  = ${LLVM_MCJIT_LIBRARY}")
     message (STATUS "LLVM lib dir  = ${LLVM_LIB_DIR}")
+    message (STATUS "LLVM libraries = ${LLVM_LIBRARIES}")
 endif ()
 
 # shared llvm library may not be available, this is not an error if we use LLVM_STATIC.
@@ -238,11 +234,10 @@ if ((LLVM_LIBRARY OR LLVM_STATIC) AND LLVM_INCLUDES AND LLVM_DIRECTORY AND LLVM_
                      OUTPUT_STRIP_TRAILING_WHITESPACE)
     string (REPLACE " " ";" LLVM_LIBRARY ${LLVM_LIBRARY})
   endif ()
-  if (VERBOSE)
+  if (NOT LLVM_FIND_QUIETLY)
       message (STATUS "LLVM OSL_LLVM_VERSION = ${OSL_LLVM_VERSION}")
       message (STATUS "LLVM library  = ${LLVM_LIBRARY}")
   endif ()
-
 
   if (NOT LLVM_LIBRARY)
     message (FATAL_ERROR "LLVM library not found.")

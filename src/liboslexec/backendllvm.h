@@ -36,7 +36,7 @@ using namespace OSL;
 using namespace OSL::pvt;
 
 #include "runtimeoptimize.h"
-#include "llvm_util.h"
+#include "OSL/llvm_util.h"
 
 
 
@@ -51,9 +51,11 @@ namespace pvt {   // OSL::pvt
 class BackendLLVM : public OSOProcessorBase {
 public:
     BackendLLVM (ShadingSystemImpl &shadingsys, ShaderGroup &group,
-                ShadingContext *context);
+                ShadingContext *context, LLVM_Util &ll);
 
     virtual ~BackendLLVM ();
+
+    virtual void set_inst (int layer);
 
     /// Create an llvm function for the whole shader group, JIT it,
     /// and store the llvm::Function* handle to it with the ShaderGroup.
@@ -72,6 +74,9 @@ public:
     /// Create an llvm function for the current shader instance.
     /// This will end up being the group entry if 'groupentry' is true.
     llvm::Function* build_llvm_instance (bool groupentry);
+
+    /// Create an llvm function for group initialization code.
+    llvm::Function* build_llvm_init ();
 
     /// Build up LLVM IR code for the given range [begin,end) or
     /// opcodes, putting them (initially) into basic block bb (or the
@@ -200,11 +205,21 @@ public:
                               const std::string &name="");
 
     /// Given the OSL symbol, return the llvm::Value* corresponding to the
-    /// start of that symbol (first element, first component, and just the
-    /// plain value if it has derivatives).
+    /// address of the start of that symbol (first element, first component,
+    /// and just the plain value if it has derivatives).  This is retrieved
+    /// from the allocation map if already there; and if not yet in the
+    /// map, the symbol is alloca'd and placed in the map.
     llvm::Value *getOrAllocateLLVMSymbol (const Symbol& sym);
 
+    /// Retrieve an llvm::Value that is a pointer holding the start address
+    /// of the specified symbol. This always works for globals and params;
+    /// for stack variables (locals/temps) is succeeds only if the symbol is
+    /// already in the allocation table (will fail otherwise). This method
+    /// is not designed to retrieve constants.
     llvm::Value *getLLVMSymbolBase (const Symbol &sym);
+
+    /// Retrieve the named global ("P", "N", etc.).
+    llvm::Value *llvm_global_symbol_ptr (ustring name);
 
     /// Test whether val is nonzero, return the llvm::Value* that's the
     /// result of a CreateICmpNE or CreateFCmpUNE (depending on the
@@ -235,8 +250,6 @@ public:
 
     llvm::Type *llvm_type_closure_component ();
     llvm::Type *llvm_type_closure_component_ptr ();
-    llvm::Type *llvm_type_closure_component_attr ();
-    llvm::Type *llvm_type_closure_component_attr_ptr ();
 
     /// Return the ShaderGlobals pointer cast as a void*.
     ///
@@ -260,7 +273,7 @@ public:
     /// data that holds all the shader params.
     llvm::Type *llvm_type_groupdata_ptr ();
 
-    /// Return the ShaderGlobals pointer.
+    /// Return the group data pointer.
     ///
     llvm::Value *groupdata_ptr () const { return m_llvm_groupdata_ptr; }
 
@@ -270,9 +283,21 @@ public:
         return ll.void_ptr (m_llvm_groupdata_ptr);
     }
 
-    /// Return a ref to where the "layer_run" flag is stored for the
-    /// named layer.
-    llvm::Value *layer_run_ptr (int layer);
+    /// Return a reference to the specified field within the group data.
+    llvm::Value *groupdata_field_ref (int fieldnum);
+
+    /// Return a pointer to the specified field within the group data,
+    /// optionally cast to pointer to a particular data type.
+    llvm::Value *groupdata_field_ptr (int fieldnum,
+                                      TypeDesc type = TypeDesc::UNKNOWN);
+
+    /// Return a ref to the bool where the "layer_run" flag is stored for
+    /// the specified layer.
+    llvm::Value *layer_run_ref (int layer);
+
+    /// Return a ref to the bool where the "userdata_initialized" flag is
+    /// stored for the specified userdata index.
+    llvm::Value *userdata_initialized_ref (int userdata_index=0);
 
     /// Generate LLVM code to zero out the variable (including derivs)
     ///
@@ -287,7 +312,14 @@ public:
     ///
     void llvm_zero_derivs (const Symbol &sym, llvm::Value *count);
 
-    void llvm_gen_debug_printf (const std::string &message);
+    /// Generate a debugging printf at shader execution time.
+    void llvm_gen_debug_printf (string_view message);
+
+    /// Generate a warning message at shader execution time.
+    void llvm_gen_warning (string_view message);
+
+    /// Generate an error message at shader execution time.
+    void llvm_gen_error (string_view message);
 
     /// Generate code to call the given layer.  If 'unconditional' is
     /// true, call it without even testing if the layer has already been
@@ -359,10 +391,24 @@ public:
     void llvm_generate_debugnan (const Opcode &op);
     /// Check for uninitialized values in all read-from arguments to the op
     void llvm_generate_debug_uninit (const Opcode &op);
+    /// Print debugging line for the op
+    void llvm_generate_debug_op_printf (const Opcode &op);
 
     llvm::Function *layer_func () const { return ll.current_function(); }
 
-    LLVM_Util ll;
+    /// Call this when JITing a texture-like call, to track how many.
+    void generated_texture_call (bool handle) {
+        shadingsys().m_stat_tex_calls_codegened += 1;
+        if (handle)
+            shadingsys().m_stat_tex_calls_as_handles += 1;
+    }
+
+    /// Return the unique/mangled function name of an instance.
+    std::string layer_function_name (ShaderInstance *inst) {
+        return Strutil::format ("%s_%d", inst->layername(), inst->id());
+    }
+
+    LLVM_Util &ll;
 
 private:
     std::vector<int> m_layer_remap;     ///< Remapping of layer ordering
@@ -384,7 +430,6 @@ private:
     llvm::Type *m_llvm_type_sg;  // LLVM type of ShaderGlobals struct
     llvm::Type *m_llvm_type_groupdata;  // LLVM type of group data
     llvm::Type *m_llvm_type_closure_component; // LLVM type for ClosureComponent
-    llvm::Type *m_llvm_type_closure_component_attr; // LLVM type for ClosureMeta::Attr
     llvm::PointerType *m_llvm_type_prepare_closure_func;
     llvm::PointerType *m_llvm_type_setup_closure_func;
     int m_llvm_local_mem;             // Amount of memory we use for locals

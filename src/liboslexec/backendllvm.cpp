@@ -27,6 +27,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 
+#include <OpenImageIO/filesystem.h>
+#include <OpenImageIO/strutil.h>
+
 #include "oslexec_pvt.h"
 #include "backendllvm.h"
 
@@ -36,6 +39,98 @@ using namespace OSL::pvt;
 OSL_NAMESPACE_ENTER
 
 namespace pvt {
+
+
+#ifdef OSL_SPI
+static void
+check_cwd (ShadingSystemImpl &shadingsys)
+{
+    std::string err;
+    char pathname[1024] = { "" };
+    if (! getcwd (pathname, sizeof(pathname)-1)) {
+        int e = errno;
+        err += Strutil::format ("Failed getcwd(), errno is %d: %s\n",
+                                errno, pathname);
+        if (e == EACCES || e == ENOENT) {
+            err += "Read/search permission problem or dir does not exist.\n";
+            const char *pwdenv = getenv ("PWD");
+            if (! pwdenv) {
+                err += "$PWD is not even found in the environment.\n";
+            } else {
+                err += Strutil::format ("$PWD is \"%s\"\n", pwdenv);
+                err += Strutil::format ("That %s.\n",
+                          OIIO::Filesystem::exists(pwdenv) ? "exists" : "does NOT exist");
+                err += Strutil::format ("That %s a directory.\n",
+                          OIIO::Filesystem::is_directory(pwdenv) ? "is" : "is NOT");
+                std::vector<std::string> pieces;
+                Strutil::split (pwdenv, pieces, "/");
+                std::string p;
+                for (size_t i = 0;  i < pieces.size();  ++i) {
+                    if (! pieces[i].size())
+                        continue;
+                    p += "/";
+                    p += pieces[i];
+                    err += Strutil::format ("  %s : %s and is%s a directory.\n", p,
+                        OIIO::Filesystem::exists(p) ? "exists" : "does NOT exist",
+                        OIIO::Filesystem::is_directory(p) ? "" : " NOT");
+                }
+            }
+        }
+    }
+    if (err.size())
+        shadingsys.error (err);
+}
+#endif
+
+
+
+BackendLLVM::BackendLLVM (ShadingSystemImpl &shadingsys,
+                          ShaderGroup &group, ShadingContext *ctx,
+                          LLVM_Util &ll)
+    : OSOProcessorBase (shadingsys, group, ctx), ll(ll),
+      m_stat_total_llvm_time(0), m_stat_llvm_setup_time(0),
+      m_stat_llvm_irgen_time(0), m_stat_llvm_opt_time(0),
+      m_stat_llvm_jit_time(0)
+{
+    ll.debug (llvm_debug());
+    ll.orc_jit (shadingsys.m_llvm_orcjit);
+#ifdef OSL_SPI
+    // Temporary (I hope) check to diagnose an intermittent failure of
+    // getcwd inside LLVM. Oy.
+    check_cwd (shadingsys);
+#endif
+}
+
+
+
+BackendLLVM::~BackendLLVM ()
+{
+}
+
+
+
+int
+BackendLLVM::llvm_debug() const
+{
+    if (shadingsys().llvm_debug() == 0)
+        return 0;
+    if (shadingsys().debug_groupname() &&
+        shadingsys().debug_groupname() != group().name())
+        return 0;
+    if (inst() && shadingsys().debug_layername() &&
+        shadingsys().debug_layername() != inst()->layername())
+        return 0;
+    return shadingsys().llvm_debug();
+}
+
+
+
+void
+BackendLLVM::set_inst (int layer)
+{
+    OSOProcessorBase::set_inst (layer);  // parent does the heavy lifting
+    ll.debug (llvm_debug());
+}
 
 
 
@@ -81,7 +176,7 @@ BackendLLVM::llvm_assign_zero (const Symbol &sym)
     // This even works for closures.
     int len;
     if (sym.typespec().is_closure_based())
-        len = sizeof(void *) * std::max(1,sym.typespec().arraylength());
+        len = sizeof(void *) * sym.typespec().numelements();
     else
         len = sym.derivsize();
     // N.B. derivsize() includes derivs, if there are any
@@ -125,30 +220,45 @@ BackendLLVM::llvm_zero_derivs (const Symbol &sym, llvm::Value *count)
     }
 }
 
-
-
-int
-BackendLLVM::ShaderGlobalNameToIndex (ustring name)
+namespace
 {
     // N.B. The order of names in this table MUST exactly match the
     // ShaderGlobals struct in oslexec.h, as well as the llvm 'sg' type
     // defined in llvm_type_sg().
     static ustring fields[] = {
-        Strings::P, ustring("_dPdz"), Strings::I, Strings::N, Strings::Ng,
-        Strings::u, Strings::v, Strings::dPdu, Strings::dPdv,
-        Strings::time, Strings::dtime, Strings::dPdtime, Strings::Ps,
+        ustring("P"), ustring("_dPdz"), ustring("I"),
+        ustring("N"), ustring("Ng"),
+        ustring("u"), ustring("v"), ustring("dPdu"), ustring("dPdv"),
+        ustring("time"), ustring("dtime"), ustring("dPdtime"), ustring("Ps"),
         ustring("renderstate"), ustring("tracedata"), ustring("objdata"),
         ustring("shadingcontext"), ustring("renderer"),
         ustring("object2common"), ustring("shader2common"),
-        Strings::Ci,
+        ustring("Ci"),
         ustring("surfacearea"), ustring("raytype"),
         ustring("flipHandedness"), ustring("backfacing")
     };
+}
 
+int
+BackendLLVM::ShaderGlobalNameToIndex (ustring name)
+{
     for (int i = 0;  i < int(sizeof(fields)/sizeof(fields[0]));  ++i)
         if (name == fields[i])
             return i;
     return -1;
+}
+
+
+
+llvm::Value *
+BackendLLVM::llvm_global_symbol_ptr (ustring name)
+{
+    // Special case for globals -- they live in the ShaderGlobals struct,
+    // we use the name of the global to find the index of the field within
+    // the ShaderGlobals struct.
+    int sg_index = ShaderGlobalNameToIndex (name);
+    ASSERT (sg_index >= 0);
+    return ll.void_ptr (ll.GEP (sg_ptr(), 0, sg_index));
 }
 
 
@@ -159,11 +269,8 @@ BackendLLVM::getLLVMSymbolBase (const Symbol &sym)
     Symbol* dealiased = sym.dealias();
 
     if (sym.symtype() == SymTypeGlobal) {
-        // Special case for globals -- they live in the shader globals struct
-        int sg_index = ShaderGlobalNameToIndex (sym.name());
-        ASSERT (sg_index >= 0);
-        llvm::Value *result = ll.GEP (sg_ptr(), 0, sg_index);
-        // No derivs?  We're one indirection too few?
+        llvm::Value *result = llvm_global_symbol_ptr (sym.name());
+        ASSERT (result);
         result = ll.ptr_to_cast (result, llvm_type(sym.typespec().elementtype()));
         return result;
     }
@@ -171,16 +278,13 @@ BackendLLVM::getLLVMSymbolBase (const Symbol &sym)
     if (sym.symtype() == SymTypeParam || sym.symtype() == SymTypeOutputParam) {
         // Special case for params -- they live in the group data
         int fieldnum = m_param_order_map[&sym];
-        llvm::Value *result = ll.GEP (groupdata_ptr(), 0, fieldnum);
-        // No derivs?  We're one indirection too few?
-        result = ll.ptr_to_cast (result, llvm_type(sym.typespec().elementtype()));
-        return result;
+        return groupdata_field_ptr (fieldnum, sym.typespec().elementtype().simpletype());
     }
 
     std::string mangled_name = dealiased->mangled();
     AllocationMap::iterator map_iter = named_values().find (mangled_name);
     if (map_iter == named_values().end()) {
-        shadingsys().error ("Couldn't find symbol '%s' (unmangled = '%s'). Did you forget to allocate it?",
+        shadingcontext()->error ("Couldn't find symbol '%s' (unmangled = '%s'). Did you forget to allocate it?",
                             mangled_name.c_str(), dealiased->name().c_str());
         return 0;
     }
@@ -537,18 +641,46 @@ BackendLLVM::llvm_store_component_value (llvm::Value* new_val,
 
 
 llvm::Value *
-BackendLLVM::layer_run_ptr (int layer)
+BackendLLVM::groupdata_field_ref (int fieldnum)
 {
-    llvm::Value *layer_run = ll.GEP (groupdata_ptr(), 0, 0);
+    return ll.GEP (groupdata_ptr(), 0, fieldnum);
+}
+
+
+llvm::Value *
+BackendLLVM::groupdata_field_ptr (int fieldnum, TypeDesc type)
+{
+    llvm::Value *result = ll.void_ptr (groupdata_field_ref (fieldnum));
+    if (type != TypeDesc::UNKNOWN)
+        result = ll.ptr_to_cast (result, llvm_type(type));
+    return result;
+}
+
+
+llvm::Value *
+BackendLLVM::layer_run_ref (int layer)
+{
+    int fieldnum = 0; // field 0 is the layer_run array
+    llvm::Value *layer_run = groupdata_field_ref (fieldnum);
     return ll.GEP (layer_run, 0, layer);
 }
 
 
 
 llvm::Value *
+BackendLLVM::userdata_initialized_ref (int userdata_index)
+{
+    int fieldnum = 1; // field 1 is the userdata_initialized array
+    llvm::Value *userdata_initiazlied = groupdata_field_ref (fieldnum);
+    return ll.GEP (userdata_initiazlied, 0, userdata_index);
+}
+
+
+
+llvm::Value *
 BackendLLVM::llvm_call_function (const char *name, 
-                                      const Symbol **symargs, int nargs,
-                                      bool deriv_ptrs)
+                                 const Symbol **symargs, int nargs,
+                                 bool deriv_ptrs)
 {
     std::vector<llvm::Value *> valargs;
     valargs.resize ((size_t)nargs);
@@ -562,8 +694,7 @@ BackendLLVM::llvm_call_function (const char *name,
         else
             valargs[i] = llvm_load_value (s);
     }
-    return ll.call_function (name, (valargs.size())? &valargs[0]: NULL,
-                             (int)valargs.size());
+    return ll.call_function (name, valargs);
 }
 
 
@@ -647,8 +778,8 @@ BackendLLVM::llvm_assign_impl (Symbol &Result, Symbol &Src,
 
     llvm::Value *arrind = arrayindex >= 0 ? ll.constant (arrayindex) : NULL;
 
-    if (Result.typespec().is_closure_based() || Src.typespec().is_closure_based()) {
-        if (Src.typespec().is_closure_based()) {
+    if (Result.typespec().is_closure() || Src.typespec().is_closure()) {
+        if (Src.typespec().is_closure()) {
             llvm::Value *srcval = llvm_load_value (Src, 0, arrind, 0);
             llvm_store_value (srcval, Result, 0, arrind, 0);
         } else {
