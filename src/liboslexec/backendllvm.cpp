@@ -85,15 +85,13 @@ check_cwd (ShadingSystemImpl &shadingsys)
 
 
 BackendLLVM::BackendLLVM (ShadingSystemImpl &shadingsys,
-                          ShaderGroup &group, ShadingContext *ctx,
-                          LLVM_Util &ll)
-    : OSOProcessorBase (shadingsys, group, ctx), ll(ll),
+                          ShaderGroup &group, ShadingContext *ctx)
+    : OSOProcessorBase (shadingsys, group, ctx),
+      ll(llvm_debug()),
       m_stat_total_llvm_time(0), m_stat_llvm_setup_time(0),
       m_stat_llvm_irgen_time(0), m_stat_llvm_opt_time(0),
       m_stat_llvm_jit_time(0)
 {
-    ll.debug (llvm_debug());
-    ll.orc_jit (shadingsys.m_llvm_orcjit);
 #ifdef OSL_SPI
     // Temporary (I hope) check to diagnose an intermittent failure of
     // getcwd inside LLVM. Oy.
@@ -679,8 +677,8 @@ BackendLLVM::userdata_initialized_ref (int userdata_index)
 
 llvm::Value *
 BackendLLVM::llvm_call_function (const char *name, 
-                                 const Symbol **symargs, int nargs,
-                                 bool deriv_ptrs)
+                                      const Symbol **symargs, int nargs,
+                                      bool deriv_ptrs)
 {
     std::vector<llvm::Value *> valargs;
     valargs.resize ((size_t)nargs);
@@ -694,7 +692,8 @@ BackendLLVM::llvm_call_function (const char *name,
         else
             valargs[i] = llvm_load_value (s);
     }
-    return ll.call_function (name, valargs);
+    return ll.call_function (name, (valargs.size())? &valargs[0]: NULL,
+                             (int)valargs.size());
 }
 
 

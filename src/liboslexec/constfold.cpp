@@ -40,12 +40,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 using namespace OSL;
 using namespace OSL::pvt;
 
-#ifdef _MSC_VER
-using OIIO::exp2f;
-using OIIO::expm1f;
-using OIIO::erff;
-using OIIO::erfcf;
-#endif
 
 // names of ops we'll be using frequently
 static ustring u_nop    ("nop"),

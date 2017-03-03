@@ -13,15 +13,8 @@ SET ( liboslexec_srcs
           opclosure.cpp
           shadeimage.cpp
           backendllvm.cpp
-          llvm_gen.cpp llvm_instance.cpp
-#          llvm_util.cpp llvm_util_old.cpp
+          llvm_gen.cpp llvm_instance.cpp llvm_util.cpp
     )
-
-if (${OSL_LLVM_VERSION} LESS 36)
-    list (APPEND liboslexec_srcs llvm_util_old)
-else ()
-    list (APPEND liboslexec_srcs llvm_util)
-endif ()
 
 # oslcomp symbols used in oslexec
 if (NOT BUILDSTATIC)
@@ -171,11 +164,6 @@ if (OSL_BUILD_TESTS)
     add_executable (accum_test accum_test.cpp)
     target_link_libraries ( accum_test oslexec oslcomp ${Boost_LIBRARIES} ${CMAKE_DL_LIBS})
     add_test (unit_accum "${CMAKE_BINARY_DIR}/src/liboslexec/accum_test")
-
-    add_executable (llvm_test llvm_test.cpp)
-    target_link_libraries ( llvm_test ${OPENIMAGEIO_LIBRARY} ${CMAKE_DL_LIBS} ${LLVM_LIBRARY} ${LLVM_MCJIT_LIBRARY}
-                            ${LLVM_LIBRARIES} ${LLVM_LDFLAGS} ${EXTRA_OSLEXEC_LIBRARIES} )
-    add_test (unit_llvm "${CMAKE_BINARY_DIR}/src/liboslexec/llvm_test")
 
     add_executable (llvmutil_test llvmutil_test.cpp)
     target_link_libraries ( llvmutil_test oslexec oslcomp ${Boost_LIBRARIES} ${CMAKE_DL_LIBS})

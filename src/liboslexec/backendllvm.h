@@ -51,7 +51,7 @@ namespace pvt {   // OSL::pvt
 class BackendLLVM : public OSOProcessorBase {
 public:
     BackendLLVM (ShadingSystemImpl &shadingsys, ShaderGroup &group,
-                ShadingContext *context, LLVM_Util &ll);
+                ShadingContext *context);
 
     virtual ~BackendLLVM ();
 
@@ -403,12 +403,7 @@ public:
             shadingsys().m_stat_tex_calls_as_handles += 1;
     }
 
-    /// Return the unique/mangled function name of an instance.
-    std::string layer_function_name (ShaderInstance *inst) {
-        return Strutil::format ("%s_%d", inst->layername(), inst->id());
-    }
-
-    LLVM_Util &ll;
+    LLVM_Util ll;
 
 private:
     std::vector<int> m_layer_remap;     ///< Remapping of layer ordering

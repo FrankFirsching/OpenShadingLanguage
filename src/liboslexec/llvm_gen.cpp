@@ -158,7 +158,7 @@ BackendLLVM::llvm_call_layer (int layer, bool unconditional)
     std::string name = Strutil::format ("%s_%d", parent->layername().c_str(),
                                         parent->id());
     // Mark the call as a fast call
-    llvm::Value *funccall = ll.call_function (name, args);
+    llvm::Value *funccall = ll.call_function (name.c_str(), args, 2);
     if (!parent->entry_layer())
         ll.mark_fast_func_call (funccall);
 
@@ -378,7 +378,8 @@ LLVMGEN (llvm_gen_printf)
 
     // Construct the function name and call it.
     std::string opname = std::string("osl_") + op.opname().string();
-    llvm::Value *ret = rop.ll.call_function (opname, call_args);
+    llvm::Value *ret = rop.ll.call_function (opname.c_str(), &call_args[0],
+                                               (int)call_args.size());
 
     // The format op returns a string value, put in in the right spot
     if (op.opname() == op_format)
@@ -402,7 +403,7 @@ LLVMGEN (llvm_gen_add)
         valargs[0] = rop.sg_void_ptr();
         valargs[1] = rop.llvm_load_value (A);
         valargs[2] = rop.llvm_load_value (B);
-        llvm::Value *res = rop.ll.call_function ("osl_add_closure_closure", valargs);
+        llvm::Value *res = rop.ll.call_function ("osl_add_closure_closure", valargs, 3);
         rop.llvm_store_value (res, Result, 0, NULL, 0);
         return true;
     }
@@ -510,8 +511,8 @@ LLVMGEN (llvm_gen_mul)
             valargs[1] = rop.llvm_load_value (B);
             valargs[2] = tfloat ? rop.llvm_load_value (A) : rop.llvm_void_ptr(A);
         }
-        llvm::Value *res = tfloat ? rop.ll.call_function ("osl_mul_closure_float", valargs)
-                                  : rop.ll.call_function ("osl_mul_closure_color", valargs);
+        llvm::Value *res = tfloat ? rop.ll.call_function ("osl_mul_closure_float", valargs, 3)
+                                  : rop.ll.call_function ("osl_mul_closure_color", valargs, 3);
         rop.llvm_store_value (res, Result, 0, NULL, 0);
         return true;
     }
@@ -1371,7 +1372,7 @@ LLVMGEN (llvm_gen_construct_color)
         args[0] = rop.sg_void_ptr ();  // shader globals
         args[1] = rop.llvm_void_ptr (Result, 0);  // color
         args[2] = rop.llvm_load_value (Space); // from
-        rop.ll.call_function ("osl_prepend_color_from", args);
+        rop.ll.call_function ("osl_prepend_color_from", args, 3);
         // FIXME(deriv): Punt on derivs for color ctrs with space names.
         // We should try to do this right, but we never had it right for
         // the interpreter, to it's probably not an emergency.
@@ -1434,10 +1435,10 @@ LLVMGEN (llvm_gen_construct_triple)
             // Note that for the case of non-constant strings, passing empty
             // from & to will make transform_points just tell us if ANY 
             // nonlinear transformations potentially are supported.
-            rop.ll.call_function ("osl_transform_triple_nonlinear", args);
+            rop.ll.call_function ("osl_transform_triple_nonlinear", args, 8);
         } else {
             // definitely not a nonlinear transformation
-            rop.ll.call_function ("osl_transform_triple", args);
+            rop.ll.call_function ("osl_transform_triple", args, 8);
         }
     }
 
@@ -1468,7 +1469,7 @@ LLVMGEN (llvm_gen_matrix)
         args[1] = rop.llvm_void_ptr(Result);  // result
         args[2] = rop.llvm_load_value(*rop.opargsym (op, 1));  // from
         args[3] = rop.llvm_load_value(*rop.opargsym (op, 2));  // to
-        rop.ll.call_function ("osl_get_from_to_matrix", args);
+        rop.ll.call_function ("osl_get_from_to_matrix", args, 4);
     } else {
         if (nfloats == 1) {
             for (int i = 0; i < 16; i++) {
@@ -1490,7 +1491,7 @@ LLVMGEN (llvm_gen_matrix)
             args[0] = rop.sg_void_ptr();  // shader globals
             args[1] = rop.llvm_void_ptr(Result);  // result
             args[2] = rop.llvm_load_value(*rop.opargsym (op, 1));  // from
-            rop.ll.call_function ("osl_prepend_matrix_from", args);
+            rop.ll.call_function ("osl_prepend_matrix_from", args, 3);
         }
     }
     if (Result.has_derivs())
@@ -1516,7 +1517,7 @@ LLVMGEN (llvm_gen_getmatrix)
     args[1] = rop.llvm_void_ptr(M);  // matrix result
     args[2] = rop.llvm_load_value(From);
     args[3] = rop.llvm_load_value(To);
-    llvm::Value *result = rop.ll.call_function ("osl_get_from_to_matrix", args);
+    llvm::Value *result = rop.ll.call_function ("osl_get_from_to_matrix", args, 4);
     rop.llvm_store_value (result, Result);
     rop.llvm_zero_derivs (M);
     return true;
@@ -1576,10 +1577,10 @@ LLVMGEN (llvm_gen_transform)
         // Note that for the case of non-constant strings, passing empty
         // from & to will make transform_points just tell us if ANY 
         // nonlinear transformations potentially are supported.
-        rop.ll.call_function ("osl_transform_triple_nonlinear", args);
+        rop.ll.call_function ("osl_transform_triple_nonlinear", args, 8);
     } else {
         // definitely not a nonlinear transformation
-        rop.ll.call_function ("osl_transform_triple", args);
+        rop.ll.call_function ("osl_transform_triple", args, 8);
     }
     return true;
 }
@@ -1784,7 +1785,8 @@ LLVMGEN (llvm_gen_regex)
     // Pass whether or not to do the full match
     call_args.push_back (rop.ll.constant(fullmatch));
 
-    llvm::Value *ret = rop.ll.call_function ("osl_regex_impl", call_args);
+    llvm::Value *ret = rop.ll.call_function ("osl_regex_impl", &call_args[0],
+                                               (int)call_args.size());
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -1876,6 +1878,7 @@ LLVMGEN (llvm_gen_sincos)
     Symbol& Theta   = *rop.opargsym (op, 0);
     Symbol& Sin_out = *rop.opargsym (op, 1);
     Symbol& Cos_out = *rop.opargsym (op, 2);
+    std::vector<llvm::Value *> valargs;
     bool theta_deriv   = Theta.has_derivs();
     bool result_derivs = (Sin_out.has_derivs() || Cos_out.has_derivs());
 
@@ -1891,13 +1894,12 @@ LLVMGEN (llvm_gen_sincos)
         else ASSERT (0);
     }
     // push back llvm arguments
-    std::vector<llvm::Value *> valargs;
     valargs.push_back ( (theta_deriv && result_derivs) || Theta.typespec().is_triple() ? 
           rop.llvm_void_ptr (Theta) : rop.llvm_load_value (Theta));
     valargs.push_back (rop.llvm_void_ptr (Sin_out));
     valargs.push_back (rop.llvm_void_ptr (Cos_out));
 
-    rop.ll.call_function (name, valargs);
+    rop.ll.call_function (name.c_str(), &valargs[0], 3);
 
     // If the input angle didn't have derivatives, we would not have
     // called the version of sincos with derivs; however in that case we
@@ -2305,7 +2307,7 @@ LLVMGEN (llvm_gen_texture)
     args.push_back (rop.ll.void_ptr (dalphadx ? dalphadx : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_texture", args);
+    rop.ll.call_function ("osl_texture", &args[0], (int)args.size());
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
@@ -2380,7 +2382,7 @@ LLVMGEN (llvm_gen_texture3d)
     args.push_back (rop.ll.void_ptr (dalphady ? dalphady : rop.ll.void_ptr_null()));
     args.push_back (rop.ll.void_ptr_null());  // No dalphadz for now
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_texture3d", args);
+    rop.ll.call_function ("osl_texture3d", &args[0], (int)args.size());
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
@@ -2446,7 +2448,7 @@ LLVMGEN (llvm_gen_environment)
         args.push_back (rop.ll.void_ptr_null());
     }
     args.push_back (rop.ll.void_ptr (errormessage ? errormessage : rop.ll.void_ptr_null()));
-    rop.ll.call_function ("osl_environment", args);
+    rop.ll.call_function ("osl_environment", &args[0], (int)args.size());
     rop.generated_texture_call (texture_handle != NULL);
     return true;
 }
@@ -2516,7 +2518,8 @@ LLVMGEN (llvm_gen_trace)
     args.push_back (rop.llvm_void_ptr (Dir, 0));
     args.push_back (rop.llvm_void_ptr (Dir, 1));
     args.push_back (rop.llvm_void_ptr (Dir, 2));
-    llvm::Value *r = rop.ll.call_function ("osl_trace", args);
+    llvm::Value *r = rop.ll.call_function ("osl_trace", &args[0],
+                                             (int)args.size());
     rop.llvm_store_value (r, Result);
     return true;
 }
@@ -2755,7 +2758,8 @@ LLVMGEN (llvm_gen_noise)
         llvm::outs() << "    " << *args[i] << "\n";
 #endif
 
-    llvm::Value *r = rop.ll.call_function (funcname, args);
+    llvm::Value *r = rop.ll.call_function (funcname.c_str(),
+                                             &args[0], (int)args.size());
     if (outdim == 1 && !derivs) {
         // Just plain float (no derivs) returns its value
         rop.llvm_store_value (r, Result);
@@ -2830,7 +2834,7 @@ LLVMGEN (llvm_gen_getattribute)
     args.push_back (rop.ll.constant_ptr ((void *) dest_type));
     args.push_back (rop.llvm_void_ptr (Destination));
 
-    llvm::Value *r = rop.ll.call_function ("osl_get_attribute", args);
+    llvm::Value *r = rop.ll.call_function ("osl_get_attribute", &args[0], args.size());
     rop.llvm_store_value (r, Result);
 
     return true;
@@ -2874,7 +2878,8 @@ LLVMGEN (llvm_gen_gettextureinfo)
     // destination
     args.push_back (rop.llvm_void_ptr (Data));
 
-    llvm::Value *r = rop.ll.call_function ("osl_get_textureinfo", args);
+    llvm::Value *r = rop.ll.call_function ("osl_get_textureinfo",
+                                           &args[0], args.size());
     rop.llvm_store_value (r, Result);
     /* Do not leave derivs uninitialized */
     if (Data.has_derivs())
@@ -2925,7 +2930,7 @@ LLVMGEN (llvm_gen_getmessage)
     args[7] = rop.ll.constant(op.sourcefile());
     args[8] = rop.ll.constant(op.sourceline());
 
-    llvm::Value *r = rop.ll.call_function ("osl_getmessage", args);
+    llvm::Value *r = rop.ll.call_function ("osl_getmessage", args, 9);
     rop.llvm_store_value (r, Result);
     return true;
 }
@@ -2959,7 +2964,7 @@ LLVMGEN (llvm_gen_setmessage)
     args[5] = rop.ll.constant(op.sourcefile());
     args[6] = rop.ll.constant(op.sourceline());
 
-    rop.ll.call_function ("osl_setmessage", args);
+    rop.ll.call_function ("osl_setmessage", args, 7);
     return true;
 }
 
@@ -3002,7 +3007,7 @@ LLVMGEN (llvm_gen_calculatenormal)
     args.push_back (rop.llvm_void_ptr (Result));
     args.push_back (rop.sg_void_ptr());
     args.push_back (rop.llvm_void_ptr (P));
-    rop.ll.call_function ("osl_calculatenormal", args);
+    rop.ll.call_function ("osl_calculatenormal", &args[0], args.size());
     if (Result.has_derivs())
         rop.llvm_zero_derivs (Result);
     return true;
@@ -3091,7 +3096,7 @@ LLVMGEN (llvm_gen_spline)
     else
         args.push_back (rop.ll.constant ((int)Knots.typespec().arraylength()));
     args.push_back (rop.ll.constant ((int)Knots.typespec().arraylength()));
-    rop.ll.call_function (name.c_str(), args);
+    rop.ll.call_function (name.c_str(), &args[0], args.size());
 
     if (Result.has_derivs() && !result_derivs)
         rop.llvm_zero_derivs (Result);
@@ -3172,12 +3177,11 @@ LLVMGEN (llvm_gen_closure)
     llvm::Value *sg_ptr = rop.sg_void_ptr();
     llvm::Value *id_int = rop.ll.constant(clentry->id);
     llvm::Value *size_int = rop.ll.constant(clentry->struct_size);
-    std::vector<llvm::Value *> alloc_args { sg_ptr, id_int, size_int };
-    if (weighted)
-        alloc_args.push_back (rop.llvm_void_ptr(*weight));
+    llvm::Value *alloc_args[4] = { sg_ptr, id_int, size_int,
+                                   weighted ? rop.llvm_void_ptr(*weight) : NULL };
     llvm::Value *return_ptr = weighted ?
-          rop.ll.call_function ("osl_allocate_weighted_closure_component", alloc_args)
-        : rop.ll.call_function ("osl_allocate_closure_component", alloc_args);
+          rop.ll.call_function ("osl_allocate_weighted_closure_component", alloc_args, 4)
+        : rop.ll.call_function ("osl_allocate_closure_component", alloc_args, 3);
     llvm::Value *comp_void_ptr = return_ptr;
 
     // For the weighted closures, we need a surrounding "if" so that it's safe
@@ -3205,7 +3209,7 @@ LLVMGEN (llvm_gen_closure)
         // Call clentry->prepare(renderservices *, int id, void *mem)
         llvm::Value *funct_ptr = rop.ll.constant_ptr((void *)clentry->prepare, rop.llvm_type_prepare_closure_func());
         llvm::Value *args[3] = {render_ptr, id_int, mem_void_ptr};
-        rop.ll.call_function (funct_ptr, args);
+        rop.ll.call_function (funct_ptr, args, 3);
     } else {
         rop.ll.op_memset (mem_void_ptr, 0, clentry->struct_size, 4 /*align*/);
     }
@@ -3237,7 +3241,7 @@ LLVMGEN (llvm_gen_closure)
         // Call clentry->setup(renderservices *, int id, void *mem)
         llvm::Value *funct_ptr = rop.ll.constant_ptr((void *)clentry->setup, rop.llvm_type_setup_closure_func());
         llvm::Value *args[3] = {render_ptr, id_int, mem_void_ptr};
-        rop.ll.call_function (funct_ptr, args);
+        rop.ll.call_function (funct_ptr, args, 3);
     }
 
     llvm_gen_keyword_fill(rop, op, clentry, closure_name, mem_void_ptr,
@@ -3342,7 +3346,7 @@ LLVMGEN (llvm_gen_pointcloud_search)
     // N.B. the op_branch sets sizeok_block as the new insert point
 
     // non-error code case
-    llvm::Value *count = rop.ll.call_function ("osl_pointcloud_search", args);
+    llvm::Value *count = rop.ll.call_function ("osl_pointcloud_search", &args[0], args.size());
     // Clear derivs if necessary
     for (size_t i = 0; i < clear_derivs_of.size(); ++i)
         rop.llvm_zero_derivs (*clear_derivs_of[i], count);
@@ -3358,7 +3362,7 @@ LLVMGEN (llvm_gen_pointcloud_search)
     args.push_back (rop.ll.constant_ptr ((void *)errorfmt.c_str()));
     args.push_back (rop.ll.constant_ptr ((void *)op.sourcefile().c_str()));
     args.push_back (rop.ll.constant (op.sourceline()));
-    rop.ll.call_function ("osl_error", args);
+    rop.ll.call_function ("osl_error", &args[0], args.size());
 
     rop.ll.op_branch (after_block);
     return true;
@@ -3403,7 +3407,7 @@ LLVMGEN (llvm_gen_pointcloud_get)
     args.push_back (rop.llvm_load_value (Attr_name));
     args.push_back (rop.ll.constant (Data.typespec().simpletype()));
     args.push_back (rop.llvm_void_ptr (Data));
-    llvm::Value *found = rop.ll.call_function ("osl_pointcloud_get", args);
+    llvm::Value *found = rop.ll.call_function ("osl_pointcloud_get", &args[0], args.size());
     rop.llvm_store_value (found, Result);
     if (Data.has_derivs())
         rop.llvm_zero_derivs (Data, count);
@@ -3417,7 +3421,7 @@ LLVMGEN (llvm_gen_pointcloud_get)
     args.push_back (rop.ll.constant_ptr ((void *)errorfmt.c_str()));
     args.push_back (rop.ll.constant_ptr ((void *)op.sourcefile().c_str()));
     args.push_back (rop.ll.constant (op.sourceline()));
-    rop.ll.call_function ("osl_error", args);
+    rop.ll.call_function ("osl_error", &args[0], args.size());
 
     rop.ll.op_branch (after_block);
     return true;
@@ -3458,7 +3462,7 @@ LLVMGEN (llvm_gen_pointcloud_write)
             rop.ll.constant (valsym->typespec().simpletype()), // type[i]
             rop.llvm_void_ptr (*valsym)  // value[i]
         };
-        rop.ll.call_function ("osl_pointcloud_write_helper", args);
+        rop.ll.call_function ("osl_pointcloud_write_helper", &args[0], 7);
     }
 
     llvm::Value * args[7] = {
@@ -3470,7 +3474,7 @@ LLVMGEN (llvm_gen_pointcloud_write)
         rop.ll.void_ptr (types),   // attribute types array
         rop.ll.void_ptr (values)   // attribute values array
     };
-    llvm::Value *ret = rop.ll.call_function ("osl_pointcloud_write", args);
+    llvm::Value *ret = rop.ll.call_function ("osl_pointcloud_write", &args[0], 7);
     rop.llvm_store_value (ret, Result);
 
     return true;
@@ -3497,7 +3501,7 @@ LLVMGEN (llvm_gen_dict_find)
     args[1] = rop.llvm_load_value(Source);
     args[2] = rop.llvm_load_value (Query);
     const char *func = sourceint ? "osl_dict_find_iis" : "osl_dict_find_iss";
-    llvm::Value *ret = rop.ll.call_function (func, args);
+    llvm::Value *ret = rop.ll.call_function (func, &args[0], 3);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3513,8 +3517,8 @@ LLVMGEN (llvm_gen_dict_next)
     Symbol& NodeID = *rop.opargsym (op, 1);
     DASSERT (Result.typespec().is_int() && NodeID.typespec().is_int());
     llvm::Value *ret = rop.ll.call_function ("osl_dict_next",
-                                             rop.sg_void_ptr(),
-                                             rop.llvm_load_value(NodeID));
+                                               rop.sg_void_ptr(),
+                                               rop.llvm_load_value(NodeID));
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3543,7 +3547,7 @@ LLVMGEN (llvm_gen_dict_value)
     args[3] = rop.ll.constant(Value.typespec().simpletype());
     // arg 4: pointer to Value
     args[4] = rop.llvm_void_ptr (Value);
-    llvm::Value *ret = rop.ll.call_function ("osl_dict_value", args);
+    llvm::Value *ret = rop.ll.call_function ("osl_dict_value", &args[0], 5);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3580,7 +3584,7 @@ LLVMGEN (llvm_gen_split)
         args[3] = rop.ll.constant (Results.typespec().arraylength());
     }
     args[4] = rop.ll.constant (Results.typespec().arraylength());
-    llvm::Value *ret = rop.ll.call_function ("osl_split", args);
+    llvm::Value *ret = rop.ll.call_function ("osl_split", &args[0], 5);
     rop.llvm_store_value (ret, R);
     return true;
 }
@@ -3606,7 +3610,7 @@ LLVMGEN (llvm_gen_raytype)
         args[1] = rop.llvm_get_pointer (Name);
         func = "osl_raytype_name";
     }
-    llvm::Value *ret = rop.ll.call_function (func, args);
+    llvm::Value *ret = rop.ll.call_function (func, args, 2);
     rop.llvm_store_value (ret, Result);
     return true;
 }
@@ -3625,7 +3629,7 @@ LLVMGEN (llvm_gen_blackbody)
 
     llvm::Value* args[3] = { rop.sg_void_ptr(), rop.llvm_void_ptr(Result),
                              rop.llvm_load_value(Temperature) };
-    rop.ll.call_function (Strutil::format("osl_%s_vf",op.opname()), args);
+    rop.ll.call_function (Strutil::format("osl_%s_vf",op.opname().c_str()).c_str(), args, 3);
 
     // Punt, zero out derivs.
     // FIXME -- only of some day, someone truly needs blackbody() to
@@ -3650,7 +3654,9 @@ LLVMGEN (llvm_gen_luminance)
     bool deriv = C.has_derivs() && Result.has_derivs();
     llvm::Value* args[3] = { rop.sg_void_ptr(), rop.llvm_void_ptr(Result),
                              rop.llvm_void_ptr(C) };
-    rop.ll.call_function (deriv ? "osl_luminance_dfdv" : "osl_luminance_fv", args);
+    rop.ll.call_function (deriv ? "osl_luminance_dfdv" : "osl_luminance_fv",
+                            args, 3);
+
     if (Result.has_derivs() && !C.has_derivs())
         rop.llvm_zero_derivs (Result);
 

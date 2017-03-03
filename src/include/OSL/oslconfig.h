@@ -113,7 +113,6 @@ using OIIO::TypeDesc;
 using OIIO::ustring;
 using OIIO::ustringHash;
 using OIIO::string_view;
-using OIIO::array_view;
 
 
 #ifndef __has_attribute
