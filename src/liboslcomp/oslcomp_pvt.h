@@ -323,8 +323,15 @@ private:
     void write_oso_const_value (const ConstantSymbol *sym) const;
     void write_oso_symbol (const Symbol *sym);
     void write_oso_metadata (const ASTNode *metanode) const;
-    // void oso (const char *fmt, ...) const;
+
+#if OIIO_VERSION >= 10803
+    template<typename... Args>
+    inline void oso (string_view fmt, const Args&... args) const {
+        (*m_osofile) << OIIO::Strutil::format (fmt, args...);
+    }
+#else
     TINYFORMAT_WRAP_FORMAT (void, oso, const, , (*m_osofile), )
+#endif
 
     void track_variable_lifetimes () {
         track_variable_lifetimes (m_ircode, m_opargs, symtab().allsyms());
@@ -398,9 +405,8 @@ private:
     int m_next_const;         ///< Next const symbol index
     std::vector<ConstantSymbol *> m_const_syms;  ///< All consts we've made
     std::ostream *m_osofile;  ///< Open .oso stream for output
-    FILE *m_sourcefile;       ///< Open file handle for retrieve_source
+    std::string m_filecontents; ///< Contents of source file
     ustring m_last_sourcefile;///< Last filename for retrieve_source
-    int m_last_sourceline;    ///< Last line read for retrieve_source
     ustring m_codegenmethod;  ///< Current method we're generating code for
     std::stack<FunctionSymbol *> m_function_stack; ///< Stack of called funcs
     int m_total_nesting;      ///< total conditional nesting level (0 == none)

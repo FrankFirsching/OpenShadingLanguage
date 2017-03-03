@@ -30,8 +30,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cmath>
 #include <cstdlib>
 
-#include <boost/regex.hpp>
-
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/sysutil.h>
 
@@ -1436,8 +1434,8 @@ DECLFOLDER(constfold_regex_search)
         DASSERT (Subj.typespec().is_string() && Reg.typespec().is_string());
         const ustring &s (*(ustring *)Subj.data());
         const ustring &r (*(ustring *)Reg.data());
-        boost::regex reg (r.string());
-        int result = boost::regex_search (s.string(), reg);
+        regex reg (r.string());
+        int result = regex_search (s.string(), reg);
         int cind = rop.add_constant (result);
         rop.turn_into_assign (op, cind, "const fold regex_search");
         return 1;
@@ -1632,6 +1630,37 @@ DECLFOLDER(constfold_mix)
         return 1;
     }
 
+    return 0;
+}
+
+
+
+DECLFOLDER(constfold_select)
+{
+    // Try to turn R=select(a,b,cond) into (per component):
+    //   R[c] = a          if cond is constant and zero
+    //   R[c] = b          if cond is constant and nonzero
+    //   R = a             if a == b (even if nothing is constant)
+    //
+    Opcode &op (rop.inst()->ops()[opnum]);
+    // int Rind = rop.oparg(op,0);
+    int Aind = rop.oparg(op,1);
+    int Bind = rop.oparg(op,2);
+    int Cind = rop.oparg(op,3);
+    Symbol &C (*rop.inst()->symbol(Cind));
+
+    if (C.is_constant() && rop.is_zero(C)) {
+        rop.turn_into_assign (op, Aind, "select(A,B,0) => A");
+        return 1;
+    }
+    if (C.is_constant() && rop.is_nonzero(C)) {
+        rop.turn_into_assign (op, Bind, "select(A,B,non-0) => B");
+        return 1;
+    }
+    if (Aind == Bind) {
+        rop.turn_into_assign (op, Aind, "select(c,a,a) -> a");
+        return 1;
+    }
     return 0;
 }
 

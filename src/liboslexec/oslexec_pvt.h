@@ -32,18 +32,23 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vector>
 #include <stack>
 #include <map>
+#include <memory>
 #include <list>
 #include <set>
+#include <unordered_map>
 
-#include <boost/regex_fwd.hpp>
-#include <boost/unordered_map.hpp>
-#include <boost/intrusive_ptr.hpp>
 #include <boost/thread/tss.hpp>   /* for thread_specific_ptr */
 
 #include <OpenImageIO/ustring.h>
 #include <OpenImageIO/thread.h>
 #include <OpenImageIO/paramlist.h>
 #include <OpenImageIO/refcnt.h>
+
+#ifdef USE_BOOST_REGEX
+# include <boost/regex.hpp>
+#else
+# include <regex>
+#endif
 
 #include "OSL/genclosure.h"
 #include "OSL/oslexec.h"
@@ -70,6 +75,19 @@ namespace Strutil = OIIO::Strutil;
 OSL_NAMESPACE_ENTER
 
 class LLVM_Util;   // forward declaration of the name
+
+
+#ifdef USE_BOOST_REGEX
+  using boost::regex;
+  using boost::regex_search;
+  using boost::regex_match;
+  using boost::match_results;
+#else
+  using std::regex;
+  using std::regex_search;
+  using std::regex_match;
+  using std::match_results;
+#endif
 
 
 
@@ -122,7 +140,7 @@ namespace pvt {
 // forward definitions
 class ShadingSystemImpl;
 class ShaderInstance;
-typedef shared_ptr<ShaderInstance> ShaderInstanceRef;
+typedef std::shared_ptr<ShaderInstance> ShaderInstanceRef;
 class Dictionary;
 class RuntimeOptimizer;
 class BackendLLVM;
@@ -339,7 +357,7 @@ inline void stlfree (T &v)
 /// individual instances of the shader.
 class ShaderMaster : public RefCnt {
 public:
-    typedef boost::intrusive_ptr<ShaderMaster> ref;
+    typedef OIIO::intrusive_ptr<ShaderMaster> ref;
     ShaderMaster (ShadingSystemImpl &shadingsys) : m_shadingsys(shadingsys) { }
     ~ShaderMaster ();
 
@@ -503,7 +521,32 @@ public:
                       TypeDesc type, const void *val);
 
     // Internal error, warning, info, and message reporting routines that
-    // take printf-like arguments.  Based on Tinyformat.
+    // take printf-like arguments.
+#if OIIO_VERSION >= 10803
+    template<typename T1, typename... Args>
+    inline void error (string_view fmt, const T1& v1, const Args&... args) const {
+        error (Strutil::format (fmt, v1, args...));
+    }
+    void error (const std::string &message) const;
+
+    template<typename T1, typename... Args>
+    inline void warning (string_view fmt, const T1& v1, const Args&... args) const {
+        warning (Strutil::format (fmt, v1, args...));
+    }
+    void warning (const std::string &message) const;
+
+    template<typename T1, typename... Args>
+    inline void info (string_view fmt, const T1& v1, const Args&... args) const {
+        info (Strutil::format (fmt, v1, args...));
+    }
+    void info (const std::string &message) const;
+
+    template<typename T1, typename... Args>
+    inline void message (string_view fmt, const T1& v1, const Args&... args) const {
+        message (Strutil::format (fmt, v1, args...));
+    }
+    void message (const std::string &message) const;
+#else
     TINYFORMAT_WRAP_FORMAT (void, error, const,
                             std::ostringstream msg;, msg, error(msg.str());)
     TINYFORMAT_WRAP_FORMAT (void, warning, const,
@@ -512,13 +555,11 @@ public:
                             std::ostringstream msg;, msg, info(msg.str());)
     TINYFORMAT_WRAP_FORMAT (void, message, const,
                             std::ostringstream msg;, msg, message(msg.str());)
-
-    /// Error reporting routines that take a pre-formatted string only.
-    ///
     void error (const std::string &message) const;
     void warning (const std::string &message) const;
     void info (const std::string &message) const;
     void message (const std::string &message) const;
+#endif
 
     std::string getstats (int level=1) const;
 
@@ -640,7 +681,7 @@ public:
 
     void optimize_all_groups (int nthreads=0, int mythread=0, int totalthreads=1);
 
-    typedef boost::unordered_map<ustring,OpDescriptor,ustringHash> OpDescriptorMap;
+    typedef std::unordered_map<ustring,OpDescriptor,ustringHash> OpDescriptorMap;
 
     /// Look up OpDescriptor for the named op, return NULL for unknown op.
     ///
@@ -860,7 +901,7 @@ private:
 
     mutable spin_mutex m_stat_mutex;     ///< Mutex for non-atomic stats
     ClosureRegistry m_closure_registry;
-    std::vector<weak_ptr<ShaderGroup> > m_all_shader_groups;
+    std::vector<std::weak_ptr<ShaderGroup> > m_all_shader_groups;
     mutable spin_mutex m_all_shader_groups_mutex;
     atomic_int m_groups_to_compile_count;
     atomic_int m_threads_currently_compiling;
@@ -937,10 +978,10 @@ typedef std::vector<Connection> ConnectionVec;
 ///        FOREACH_PARAM (Symbol &s, inst) { ... stuff with s... }
 ///
 #define FOREACH_PARAM(symboldecl,inst) \
-    BOOST_FOREACH (symboldecl, param_range(inst))
+    for (symboldecl : param_range(inst))
 
 #define FOREACH_SYM(symboldecl,inst) \
-    BOOST_FOREACH (symboldecl, sym_range(inst))
+    for (symboldecl : sym_range(inst))
 
 
 
@@ -1096,37 +1137,49 @@ public:
     int firstparam () const { return m_firstparam; }
     int lastparam () const { return m_lastparam; }
 
-    /// Return a begin/end Symbol* pair for the set of param symbols
-    /// that is suitable to pass as a range for BOOST_FOREACH.
-    friend std::pair<Symbol *,Symbol *> param_range (ShaderInstance *i) {
+    // Range type suitable for use with "range for"
+    template<typename T>   // T should be Symbol or const Symbol
+    struct SymRange {
+        SymRange () : m_begin(nullptr), m_end(nullptr) {}
+        SymRange (T *a, T *b) : m_begin(a), m_end(b) {}
+        T *begin () const { return m_begin; }
+        T *end () const { return m_end; }
+    private:
+        T* m_begin;
+        T* m_end;
+    };
+
+    /// Return a SymRange for the set of param symbols that is suitable to
+    /// pass as a "range for".
+    friend SymRange<Symbol> param_range (ShaderInstance *i) {
         if (i->m_instsymbols.size() == 0 || i->firstparam() == i->lastparam())
-            return std::pair<Symbol*,Symbol*> ((Symbol*)NULL, (Symbol*)NULL);
+            return SymRange<Symbol> ();
         else
-            return std::pair<Symbol*,Symbol*> (&i->m_instsymbols[0] + i->firstparam(),
-                                               &i->m_instsymbols[0] + i->lastparam());
+            return SymRange<Symbol> (&i->m_instsymbols[0] + i->firstparam(),
+                                     &i->m_instsymbols[0] + i->lastparam());
     }
 
-    friend std::pair<const Symbol *,const Symbol *> param_range (const ShaderInstance *i) {
+    friend SymRange<const Symbol> param_range (const ShaderInstance *i) {
         if (i->m_instsymbols.size() == 0 || i->firstparam() == i->lastparam())
-            return std::pair<const Symbol*,const Symbol*> ((const Symbol*)NULL, (const Symbol*)NULL);
+            return SymRange<const Symbol> ();
         else
-            return std::pair<const Symbol*,const Symbol*> (&i->m_instsymbols[0] + i->firstparam(),
-                                                           &i->m_instsymbols[0] + i->lastparam());
+            return SymRange<const Symbol> (&i->m_instsymbols[0] + i->firstparam(),
+                                           &i->m_instsymbols[0] + i->lastparam());
     }
 
-    friend std::pair<Symbol *,Symbol *> sym_range (ShaderInstance *i) {
+    friend SymRange<Symbol> sym_range (ShaderInstance *i) {
         if (i->m_instsymbols.size() == 0)
-            return std::pair<Symbol*,Symbol*> ((Symbol*)NULL, (Symbol*)NULL);
+            return SymRange<Symbol> ();
         else
-            return std::pair<Symbol*,Symbol*> (&i->m_instsymbols[0],
-                                               &i->m_instsymbols[0] + i->m_instsymbols.size());
+            return SymRange<Symbol> (&i->m_instsymbols[0],
+                                     &i->m_instsymbols[0] + i->m_instsymbols.size());
     }
-    friend std::pair<const Symbol *,const Symbol *> sym_range (const ShaderInstance *i) {
+    friend SymRange<const Symbol> sym_range (const ShaderInstance *i) {
         if (i->m_instsymbols.size() == 0)
-            return std::pair<const Symbol*,const Symbol*> ((const Symbol*)NULL, (const Symbol*)NULL);
+            return SymRange<const Symbol> ();
         else
-            return std::pair<const Symbol*,const Symbol*> (&i->m_instsymbols[0],
-                                               &i->m_instsymbols[0] + i->m_instsymbols.size());
+            return SymRange<const Symbol> (&i->m_instsymbols[0],
+                                           &i->m_instsymbols[0] + i->m_instsymbols.size());
     }
 
     int Psym () const { return m_Psym; }
@@ -1596,7 +1649,7 @@ public:
     /// Return a reference to a compiled regular expression for the
     /// given string, being careful to cache already-created ones so we
     /// aren't constantly compiling new ones.
-    const boost::regex & find_regex (ustring r);
+    const regex & find_regex (ustring r);
 
     /// Return a pointer to the shading group for this context.
     ///
@@ -1685,6 +1738,27 @@ public:
     // Process all the recorded errors, warnings, printfs
     void process_errors () const;
 
+#if OIIO_VERSION >= 10803
+    template<typename... Args>
+    inline void error (string_view fmt, const Args&... args) const {
+        record_error(ErrorHandler::EH_ERROR, Strutil::format (fmt, args...));
+    }
+
+    template<typename... Args>
+    inline void warning (string_view fmt, const Args&... args) const {
+        record_error(ErrorHandler::EH_WARNING, Strutil::format (fmt, args...));
+    }
+
+    template<typename... Args>
+    inline void info (string_view fmt, const Args&... args) const {
+        record_error(ErrorHandler::EH_INFO, Strutil::format (fmt, args...));
+    }
+
+    template<typename... Args>
+    inline void message (string_view fmt, const Args&... args) const {
+        record_error(ErrorHandler::EH_MESSAGE, Strutil::format (fmt, args...));
+    }
+#else
     TINYFORMAT_WRAP_FORMAT (void, error, const,
                             std::ostringstream msg;, msg,
                             record_error(ErrorHandler::EH_ERROR, msg.str());)
@@ -1697,6 +1771,7 @@ public:
     TINYFORMAT_WRAP_FORMAT (void, message, const,
                             std::ostringstream msg;, msg,
                             record_error(ErrorHandler::EH_MESSAGE, msg.str());)
+#endif
 
 private:
 
@@ -1708,7 +1783,7 @@ private:
     mutable TextureSystem::Perthread *m_texture_thread_info; ///< Ptr to texture thread info
     ShaderGroup *m_group;               ///< Ptr to shader group
     std::vector<char> m_heap;           ///< Heap memory
-    typedef boost::unordered_map<ustring, boost::regex*, ustringHash> RegexMap;
+    typedef std::unordered_map<ustring, std::unique_ptr<regex>, ustringHash> RegexMap;
     RegexMap m_regex_map;               ///< Compiled regex's
     MessageList m_messages;             ///< Message blackboard
     int m_max_warnings;                 ///< To avoid processing too many warnings
@@ -1861,6 +1936,9 @@ public:
 
     /// Is the symbol a constant whose value is 1?
     static bool is_one (const Symbol &A);
+
+    /// Is the symbol a constant whose value is nonzero in all components?
+    static bool is_nonzero (const Symbol &A);
 
     /// For debugging, express A's constant value as a string.
     static std::string const_value_as_string (const Symbol &A);

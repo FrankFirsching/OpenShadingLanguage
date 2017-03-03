@@ -31,10 +31,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cstdio>
 #include <fstream>
 #include <cstdlib>
-
-#include <boost/algorithm/string.hpp>
-#include <boost/foreach.hpp>
-#include <boost/thread.hpp>
+#include <mutex>
 
 #include "oslexec_pvt.h"
 #include "OSL/genclosure.h"
@@ -649,7 +646,7 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_opt_seed_bblock_aliases(true),
       m_optimize_nondebug(false),
       m_opt_passes(10),
-      m_llvm_optimize(0), m_llvm_orcjit(false),
+      m_llvm_optimize(0),
       m_debug(0), m_llvm_debug(0),
       m_llvm_debug_layers(0), m_llvm_debug_ops(0),
       m_commonspace_synonym("world"),
@@ -900,6 +897,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (regex_search, regex,              regex_search,  false,     0);
     OP (return,      return,              none,          false,     0);
     OP (round,       generic,             none,          true,      0);
+    OP (select,      select,              select,        true,      0);
     OP (setmessage,  setmessage,          setmessage,    false,     0);
     OP (shl,         bitwise_binary_op,   none,          true,      0);
     OP (shr,         bitwise_binary_op,   none,          true,      0);
@@ -1066,7 +1064,6 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
     ATTR_SET ("opt_passes", int, m_opt_passes);
     ATTR_SET ("optimize_nondebug", int, m_optimize_nondebug);
     ATTR_SET ("llvm_optimize", int, m_llvm_optimize);
-    ATTR_SET ("llvm_orcjit", int, m_llvm_orcjit);
     ATTR_SET ("llvm_debug", int, m_llvm_debug);
     ATTR_SET ("llvm_debug_layers", int, m_llvm_debug_layers);
     ATTR_SET ("llvm_debug_ops", int, m_llvm_debug_ops);
@@ -1175,7 +1172,6 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     ATTR_DECODE ("opt_passes", int, m_opt_passes);
     ATTR_DECODE ("optimize_nondebug", int, m_optimize_nondebug);
     ATTR_DECODE ("llvm_optimize", int, m_llvm_optimize);
-    ATTR_DECODE ("llvm_orcjit", int, m_llvm_orcjit);
     ATTR_DECODE ("debug", int, m_debug);
     ATTR_DECODE ("llvm_debug", int, m_llvm_debug);
     ATTR_DECODE ("llvm_debug_layers", int, m_llvm_debug_layers);
@@ -1491,7 +1487,7 @@ ShadingSystemImpl::error (const std::string &msg) const
 {
     lock_guard guard (m_errmutex);
     int n = 0;
-    BOOST_FOREACH (std::string &s, m_errseen) {
+    for (auto&& s : m_errseen) {
         if (s == msg)
             return;
         ++n;
@@ -1509,7 +1505,7 @@ ShadingSystemImpl::warning (const std::string &msg) const
 {
     lock_guard guard (m_errmutex);
     int n = 0;
-    BOOST_FOREACH (std::string &s, m_warnseen) {
+    for (auto&& s : m_warnseen) {
         if (s == msg)
             return;
         ++n;
@@ -1575,7 +1571,8 @@ ShadingSystemImpl::getstats (int level) const
         return "";
     std::ostringstream out;
     out << "OSL ShadingSystem statistics (" << (void*)this;
-    out << ") ver " << OSL_LIBRARY_VERSION_STRING << "\n";
+    out << ") ver " << OSL_LIBRARY_VERSION_STRING
+        << ", LLVM " << OSL_LLVM_FULL_VERSION << "\n";
     if (m_stat_shaders_requested == 0) {
         out << "  No shaders requested\n";
         return out.str();
@@ -1587,7 +1584,6 @@ ShadingSystemImpl::getstats (int level) const
 #define STROPT(name) if (m_##name.size()) opt += Strutil::format(#name "=\"%s\" ", m_##name)
     INTOPT (optimize);
     INTOPT (llvm_optimize);
-    INTOPT (llvm_orcjit);
     INTOPT (debug);
     INTOPT (profile);
     INTOPT (llvm_debug);
@@ -2646,47 +2642,31 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
 
     // Copy some info recorted by the RuntimeOptimizer into the group
     group.m_unknown_textures_needed = rop.m_unknown_textures_needed;
-    BOOST_FOREACH (ustring f, rop.m_textures_needed)
+    for (auto&& f : rop.m_textures_needed)
         group.m_textures_needed.push_back (f);
     group.m_unknown_closures_needed = rop.m_unknown_closures_needed;
-    BOOST_FOREACH (ustring f, rop.m_closures_needed)
+    for (auto&& f : rop.m_closures_needed)
         group.m_closures_needed.push_back (f);
-    BOOST_FOREACH (ustring f, rop.m_globals_needed)
+    for (auto&& f : rop.m_globals_needed)
         group.m_globals_needed.push_back (f);
     size_t num_userdata = rop.m_userdata_needed.size();
     group.m_userdata_names.reserve (num_userdata);
     group.m_userdata_types.reserve (num_userdata);
     group.m_userdata_offsets.resize (num_userdata, 0);
     group.m_userdata_derivs.reserve (num_userdata);
-    BOOST_FOREACH (const UserDataNeeded& n, rop.m_userdata_needed) {
+    for (auto&& n : rop.m_userdata_needed) {
         group.m_userdata_names.push_back (n.name);
         group.m_userdata_types.push_back (n.type);
         group.m_userdata_derivs.push_back (n.derivs);
     }
     group.m_unknown_attributes_needed = rop.m_unknown_attributes_needed;
-    BOOST_FOREACH (const AttributeNeeded &f, rop.m_attributes_needed) {
+    for (auto&& f : rop.m_attributes_needed) {
         group.m_attributes_needed.push_back (f.name);
         group.m_attribute_scopes.push_back (f.scope);
     }
 
-    {
-        // FIXME -- for now, have only one LLVM_Util for the whole
-        // ShadingSystem, guard it with a mutex. Later, we should make a
-        // pool of them so multiple threads can JIT simultaneously.
-        lock_guard lock (m_llvmutil_mutex);
-        if (! m_llvmutil)
-            m_llvmutil.reset (new LLVM_Util);
-        BackendLLVM lljitter (*this, group, ctx, *m_llvmutil);
-        lljitter.run ();
-
-        m_stat_total_llvm_time += lljitter.m_stat_total_llvm_time;
-        m_stat_llvm_setup_time += lljitter.m_stat_llvm_setup_time;
-        m_stat_llvm_irgen_time += lljitter.m_stat_llvm_irgen_time;
-        m_stat_llvm_opt_time += lljitter.m_stat_llvm_opt_time;
-        m_stat_llvm_jit_time += lljitter.m_stat_llvm_jit_time;
-        m_stat_max_llvm_local_mem = std::max (m_stat_max_llvm_local_mem,
-                                              lljitter.m_llvm_local_mem);
-    }
+    BackendLLVM lljitter (*this, group, ctx);
+    lljitter.run ();
 
     group_post_jit_cleanup (group);
 
@@ -2697,6 +2677,13 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
     m_stat_optimization_time += timer();
     m_stat_opt_locking_time += locking_time + rop.m_stat_opt_locking_time;
     m_stat_specialization_time += rop.m_stat_specialization_time;
+    m_stat_total_llvm_time += lljitter.m_stat_total_llvm_time;
+    m_stat_llvm_setup_time += lljitter.m_stat_llvm_setup_time;
+    m_stat_llvm_irgen_time += lljitter.m_stat_llvm_irgen_time;
+    m_stat_llvm_opt_time += lljitter.m_stat_llvm_opt_time;
+    m_stat_llvm_jit_time += lljitter.m_stat_llvm_jit_time;
+    m_stat_max_llvm_local_mem = std::max (m_stat_max_llvm_local_mem,
+                                          lljitter.m_llvm_local_mem);
     m_stat_groups_compiled += 1;
     m_stat_instances_compiled += group.nlayers();
     m_groups_to_compile_count -= 1;
@@ -2717,15 +2704,15 @@ ShadingSystemImpl::optimize_all_groups (int nthreads, int mythread, int totalthr
     // Spawn a bunch of threads to do this in parallel -- just call this
     // routine again (with threads=1) for each thread.
     if (nthreads < 1)  // threads <= 0 means use all hardware available
-        nthreads = std::min ((int)boost::thread::hardware_concurrency(),
+        nthreads = std::min ((int)std::thread::hardware_concurrency(),
                              (int)m_groups_to_compile_count);
     if (nthreads > 1) {
         if (m_threads_currently_compiling)
             return;   // never mind, somebody else spawned the JIT threads
-        boost::thread_group threads;
+        OIIO::thread_group threads;
         m_threads_currently_compiling += nthreads;
         for (int t = 0;  t < nthreads;  ++t)
-            threads.add_thread (new boost::thread (optimize_all_groups_wrapper, this, t, nthreads));
+            threads.add_thread (new std::thread (optimize_all_groups_wrapper, this, t, nthreads));
         threads.join_all ();
         m_threads_currently_compiling -= nthreads;
         return;
@@ -2924,7 +2911,7 @@ ShadingSystemImpl::archive_shadergroup (ShaderGroup *group, string_view filename
 
     std::string filename_list = "shadergroup";
     {
-        boost::lock_guard<ShaderGroup> lock (*group);
+        std::lock_guard<ShaderGroup> lock (*group);
         std::set<std::string> entries;   // to avoid duplicates
         for (int i = 0, nl = group->nlayers(); i < nl; ++i) {
             std::string osofile = (*group)[i]->master()->osofilename();

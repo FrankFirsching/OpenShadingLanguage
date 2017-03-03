@@ -29,44 +29,41 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include "export.h"
-#include "oslconfig.h"
+#include "oslversion.h"
 
-#include <memory>
 #include <vector>
-
-#ifndef OSL_LLVM_VERSION
-#  include <llvm/Config/config.h>
-#  define OSL_LLVM_VERSION (LLVM_VERSION_MAJOR*10+LLVM_VERSION_MINOR)
-#endif
-
-#if OSL_LLVM_VERSION < 36
-#  include "llvm_util_old.h"
-#else
-
 
 #ifdef LLVM_NAMESPACE
 namespace llvm = LLVM_NAMESPACE;
 #endif
 
 namespace llvm {
-  // Opaque type definitions
   class BasicBlock;
   class ConstantFolder;
   class ExecutionEngine;
   class Function;
   class FunctionType;
+  class JITMemoryManager;
+  class Linker;
   class LLVMContext;
   class Module;
   class PointerType;
   class Type;
   class Value;
-  template<typename T, typename Inserter> class IRBuilder;
-  class IRBuilderDefaultInserter;
+  namespace legacy {
+    class FunctionPassManager;
+    class PassManager;
+  }
 }
 
 
 
 OSL_NAMESPACE_ENTER
+
+namespace pvt {   // OSL::pvt
+
+
+
 
 
 /// Wrapper class around LLVM functionality.  This handles all the
@@ -79,78 +76,86 @@ public:
     ~LLVM_Util ();
 
     struct PerThreadInfo;
-    typedef llvm::IRBuilder<llvm::ConstantFolder,
-                            llvm::IRBuilderDefaultInserter> IRBuilder;
 
     /// Set debug level
-    void debug (int d);
-    int debug () const;
-
-    /// Set whether or not we are using ORC JIT (default: MCJIT)
-    void orc_jit (bool enable);
-    bool orc_jit () const;
+    void debug (int d) { m_debug = d; }
+    int debug () const { return m_debug; }
 
     /// Return a reference to the current context.
-    llvm::LLVMContext &context () const;
+    llvm::LLVMContext &context () const { return *m_llvm_context; }
 
     /// Return a pointer to the current module.  Make a new one if
     /// necessary.
-    llvm::Module *module ();
+    llvm::Module *module () {
+        if (! m_llvm_module)
+            m_llvm_module = new_module();
+        return m_llvm_module;
+    }
 
-    /// Create a new empty module, make it the current module.
-    llvm::Module *new_module (string_view id = "default");
+    /// Set the current module to m.
+    void module (llvm::Module *m) { m_llvm_module = m; }
+
+    /// Create a new empty module.
+    llvm::Module *new_module (const char *id = "default");
 
     /// Create a new module, populated with functions from the buffer
-    /// bitcode[0..size-1], make it the current module.  The name identifies
-    /// the buffer.  If err is not NULL, error messages will be stored
-    /// there.
-    llvm::Module *module_from_bitcode (string_view bitcode,
-                                       string_view name = "",
+    /// bitcode[0..size-1].  The name identifies the buffer.  If err is not
+    /// NULL, error messages will be stored there.
+    llvm::Module *module_from_bitcode (const char *bitcode, size_t size,
+                                       const std::string &name=std::string(),
                                        std::string *err=NULL);
 
-    enum HasVarArgs { NoVarArgs=0, VarArgs=1 };
-
     /// Create a new function (that will later be populated with
-    /// instructions). If varargs is VarArgs, it will be marked as having
-    /// var args (default: no). If stub is StubOnly, the function will be a
-    /// stub only, but if it is FunctionWithCode (the default), the new
-    /// function will be the "current function" with a new basic block and
-    /// the insertion point set (so any subsequent ops will start filling in
-    /// the function's code. If no module has yet been created, a
-    /// new_module() will be created to house the function.
-    llvm::Function *make_function (string_view, bool fastcall,
-                                   llvm::Type *rettype,
-                                   array_view<llvm::Type*> paramtypes,
-                                   HasVarArgs varargs=NoVarArgs);
-    /// make_function with individually-passed parameter types (for up to 5
-    /// parameters).
-    llvm::Function *make_function (string_view, bool fastcall,
+    /// instructions) with up to 4 args.
+    llvm::Function *make_function (const std::string &name, bool fastcall,
                                    llvm::Type *rettype,
                                    llvm::Type *arg1=NULL,
                                    llvm::Type *arg2=NULL,
                                    llvm::Type *arg3=NULL,
                                    llvm::Type *arg4=NULL);
 
-    /// Create the declaration for a function that will be resolved
-    /// externally. It does not change the "current" function or the
-    /// IR insertion point.
-    llvm::Function *declare_extern_function (string_view, llvm::Type *rettype,
-                                             array_view<llvm::Type*> paramtypes,
-                                             HasVarArgs varargs=NoVarArgs);
+    /// Create a new function (that will later be populated with
+    /// instructions) with a vector of args.
+    llvm::Function *make_function (const std::string &name, bool fastcall,
+                                   llvm::Type *rettype,
+                                   const std::vector<llvm::Type*> &paramtypes,
+                                   bool varargs=false);
 
     /// Set up a new current function that subsequent basic blocks will
     /// be added to.
-    void current_function (llvm::Function *func);
+    void current_function (llvm::Function *func) { m_current_function = func; }
 
     /// Return a ptr to the current function we're generating.
-    llvm::Function *current_function () const;
+    llvm::Function *current_function () const { return m_current_function; }
 
     /// Return the value ptr for the a-th argument of the current function.
     llvm::Value *current_function_arg (int a);
 
-    /// Return the current IR builder, create a new one (for the current
-    /// function) if necessary.
-    IRBuilder &builder ();
+
+    /// Create a new IR builder with the given block as entry point. If
+    /// block is NULL, a new basic block for the current function will be
+    /// created.
+    void new_builder (llvm::BasicBlock *block=NULL);
+
+    /// End the current builder
+    void end_builder ();
+
+    /// Create a new JITing ExecutionEngine and make it the current one.
+    /// Return a pointer to the new engine.  If err is not NULL, put any
+    /// errors there.
+    llvm::ExecutionEngine *make_jit_execengine (std::string *err=NULL);
+
+    /// Return a pointer to the current ExecutionEngine.  Create a JITing
+    /// ExecutionEngine if one isn't already set up.
+    llvm::ExecutionEngine *execengine () {
+        if (! m_llvm_exec)
+            make_jit_execengine();
+        return m_llvm_exec;
+    }
+
+    /// Replace the ExecutionEngine (pass NULL to simply delete the
+    /// current one).
+    void execengine (llvm::ExecutionEngine *exec);
 
     /// Change symbols in the module that are marked as having external
     /// linkage to an alternate linkage that allows them to be discarded if
@@ -165,28 +170,20 @@ public:
     void setup_optimization_passes (int optlevel);
 
     /// Run the optimization passes.
-    void do_optimize ();
-
-    /// Call when we've finished adding functions to the module and are
-    /// ready to optimize and codegen it.
-    void module_done ();
+    void do_optimize (std::string *err = NULL);
 
     /// Retrieve a callable pointer to the JITed version of a function.
     /// This will JIT the function if it hasn't already done so. Be sure
     /// you have already called do_optimize() if you want optimization.
-    void *get_compiled_function (string_view name);
-    // void *get_compiled_function (llvm::Function *func);
-
-    typedef void* (*FunctionResolver)(const std::string &);
+    void *getPointerToFunction (llvm::Function *func);
 
     /// Wrap ExecutionEngine::InstallLazyFunctionCreator.
     void InstallLazyFunctionCreator (void* (*P)(const std::string &));
 
 
     /// Create a new LLVM basic block (for the current function) and return
-    /// its handle. If insert is true, set the insertion point for new
-    /// IR ops to be the new BB.
-    llvm::BasicBlock *new_basic_block (string_view name="", bool insert=false);
+    /// its handle.
+    llvm::BasicBlock *new_basic_block (const std::string &name=std::string());
 
     /// Save the return block pointer when entering a function. If
     /// after==NULL, generate a new basic block for where to go after the
@@ -215,24 +212,24 @@ public:
     llvm::BasicBlock *loop_after_block () const;
 
 
-    llvm::Type *type_float() const;
-    llvm::Type *type_int() const;
-    llvm::Type *type_addrint() const;
-    llvm::Type *type_bool() const;
-    llvm::Type *type_char() const;
-    llvm::Type *type_longlong() const;
-    llvm::Type *type_void() const;
-    llvm::Type *type_triple() const;
-    llvm::Type *type_matrix() const;
-    llvm::Type *type_typedesc() const;
-    llvm::PointerType *type_void_ptr() const;
-    llvm::PointerType *type_string() const;
-    llvm::PointerType *type_ustring_ptr() const;
-    llvm::PointerType *type_char_ptr() const;
-    llvm::PointerType *type_int_ptr() const;
-    llvm::PointerType *type_float_ptr() const;
-    llvm::PointerType *type_triple_ptr() const;
-    llvm::PointerType *type_matrix_ptr() const;
+    llvm::Type *type_float() const { return m_llvm_type_float; }
+    llvm::Type *type_int() const { return m_llvm_type_int; }
+    llvm::Type *type_addrint() const { return m_llvm_type_addrint; }
+    llvm::Type *type_bool() const { return m_llvm_type_bool; }
+    llvm::Type *type_char() const { return m_llvm_type_char; }
+    llvm::Type *type_longlong() const { return m_llvm_type_longlong; }
+    llvm::Type *type_void() const { return m_llvm_type_void; }
+    llvm::Type *type_triple() const { return m_llvm_type_triple; }
+    llvm::Type *type_matrix() const { return m_llvm_type_matrix; }
+    llvm::Type *type_typedesc() const { return m_llvm_type_longlong; }
+    llvm::PointerType *type_void_ptr() const { return m_llvm_type_void_ptr; }
+    llvm::PointerType *type_string() { return m_llvm_type_char_ptr; }
+    llvm::PointerType *type_ustring_ptr() const { return m_llvm_type_ustring_ptr; }
+    llvm::PointerType *type_char_ptr() const { return m_llvm_type_char_ptr; }
+    llvm::PointerType *type_int_ptr() const { return m_llvm_type_int_ptr; }
+    llvm::PointerType *type_float_ptr() const { return m_llvm_type_float_ptr; }
+    llvm::PointerType *type_triple_ptr() const { return m_llvm_type_triple_ptr; }
+    llvm::PointerType *type_matrix_ptr() const { return m_llvm_type_matrix_ptr; }
 
     /// Generate the appropriate llvm type definition for a TypeDesc
     /// (this is the actual type, for example when we allocate it).
@@ -245,7 +242,7 @@ public:
     /// This will return a llvm::Type that is the same as a C struct
     /// comprised fields of the given types[], in order.
     llvm::Type *type_struct (const std::vector<llvm::Type *> &types,
-                             string_view name="");
+                             const std::string &name="");
 
     /// Return the llvm::Type that is a pointer to the given llvm type.
     llvm::Type *type_ptr (llvm::Type *type);
@@ -258,14 +255,14 @@ public:
     /// given return types, parameter types (in a vector), and whether it
     /// uses varargs conventions.
     llvm::FunctionType *type_function (llvm::Type *rettype,
-                                       array_view<llvm::Type*> params,
-                                       HasVarArgs varargs=NoVarArgs);
+                                       const std::vector<llvm::Type*> &params,
+                                       bool varargs=false);
 
     /// Return a llvm::PointerType that's a pointer to the described
     /// kind of function.
     llvm::PointerType *type_function_ptr (llvm::Type *rettype,
-                                          array_view<llvm::Type*> params,
-                                          HasVarArgs varargs=NoVarArgs);
+                                          const std::vector<llvm::Type*> &params,
+                                          bool varargs=false);
 
     /// Return the human-readable name of the type of the llvm type.
     std::string llvm_typename (llvm::Type *type) const;
@@ -295,7 +292,7 @@ public:
 
     /// Return an llvm::Value holding the given string constant.
     llvm::Value *constant (OIIO::ustring s);
-    llvm::Value *constant (string_view s) {
+    llvm::Value *constant (OIIO::string_view s) {
         return constant(OIIO::ustring(s));
     }
 
@@ -333,47 +330,50 @@ public:
     /// Generate an alloca instruction to allocate space for n copies of the
     /// given llvm type, and return its pointer.
     llvm::Value *op_alloca (llvm::Type *llvmtype, int n=1,
-                            string_view name="");
+                            const std::string &name=std::string());
     llvm::Value *op_alloca (llvm::PointerType *llvmtype, int n=1,
-                            string_view name="") {
+                            const std::string &name=std::string()) {
         return op_alloca ((llvm::Type *)llvmtype, n, name);
     }
 
     /// Generate an alloca instruction to allocate space for n copies of the
     /// given type, and return its pointer.
     llvm::Value *op_alloca (const OIIO::TypeDesc &type, int n=1,
-                            string_view name="");
+                            const std::string &name=std::string());
 
     /// Generate code for a call to the function pointer, with the given
     /// arg list.  Return an llvm::Value* corresponding to the return
     /// value of the function, if any.
     llvm::Value *call_function (llvm::Value *func,
-                                OIIO::array_view<llvm::Value *> args);
+                                llvm::Value **args, int nargs);
     /// Generate code for a call to the named function with the given arg
     /// list.  Return an llvm::Value* corresponding to the return value of
     /// the function, if any.
-    llvm::Value *call_function (string_view name,
-                                OIIO::array_view<llvm::Value *> args);
-
-    llvm::Value *call_function (string_view name, llvm::Value *arg0) {
-        llvm::Value *args[1] = { arg0 };
-        return call_function (name, args);
+    llvm::Value *call_function (const char *name,
+                                llvm::Value **args, int nargs);
+    template<size_t N>
+    llvm::Value* call_function (const char *name, llvm::Value* (&args)[N]) {
+        return call_function (name, &args[0], int(N));
     }
-    llvm::Value *call_function (string_view name, llvm::Value *arg0,
+
+    llvm::Value *call_function (const char *name, llvm::Value *arg0) {
+        return call_function (name, &arg0, 1);
+    }
+    llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1) {
         llvm::Value *args[2] = { arg0, arg1 };
-        return call_function (name, args);
+        return call_function (name, args, 2);
     }
-    llvm::Value *call_function (string_view name, llvm::Value *arg0,
+    llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2) {
         llvm::Value *args[3] = { arg0, arg1, arg2 };
-        return call_function (name, args);
+        return call_function (name, args, 3);
     }
-    llvm::Value *call_function (string_view name, llvm::Value *arg0,
+    llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2,
                                 llvm::Value *arg3) {
         llvm::Value *args[4] = { arg0, arg1, arg2, arg3 };
-        return call_function (name, args);
+        return call_function (name, args, 4);
     }
 
     /// Mark the function call (which MUST be the value returned by a
@@ -381,8 +381,7 @@ public:
     void mark_fast_func_call (llvm::Value *funccall);
 
     /// Set the code insertion point for subsequent ops to block.
-    /// If block is NULL, create a new basic block for the current function.
-    void set_insert_point (llvm::BasicBlock *block=NULL);
+    void set_insert_point (llvm::BasicBlock *block);
 
     /// Return op from a void function.  If retval is NULL, we are returning
     /// from a void function.
@@ -486,14 +485,46 @@ public:
     static size_t total_jit_memory_held ();
 
 private:
-    class Impl;
-    std::unique_ptr<Impl> m_impl;
-    Impl *impl() { return m_impl.get(); }
+    class MemoryManager;
+    class IRBuilder;
+
+    void SetupLLVM ();
+    IRBuilder& builder();
+
+    int m_debug;
+    PerThreadInfo *m_thread;
+    llvm::LLVMContext *m_llvm_context;
+    llvm::Module *m_llvm_module;
+    IRBuilder *m_builder;
+    MemoryManager *m_llvm_jitmm;
+    llvm::Function *m_current_function;
+    llvm::legacy::PassManager *m_llvm_module_passes;
+    llvm::legacy::FunctionPassManager *m_llvm_func_passes;
+    llvm::ExecutionEngine *m_llvm_exec;
+    std::vector<llvm::BasicBlock *> m_return_block;     // stack for func call
+    std::vector<llvm::BasicBlock *> m_loop_after_block; // stack for break
+    std::vector<llvm::BasicBlock *> m_loop_step_block;  // stack for continue
+
+    llvm::Type *m_llvm_type_float;
+    llvm::Type *m_llvm_type_int;
+    llvm::Type *m_llvm_type_addrint;
+    llvm::Type *m_llvm_type_bool;
+    llvm::Type *m_llvm_type_char;
+    llvm::Type *m_llvm_type_longlong;
+    llvm::Type *m_llvm_type_void;
+    llvm::Type *m_llvm_type_triple;
+    llvm::Type *m_llvm_type_matrix;
+    llvm::PointerType *m_llvm_type_void_ptr;
+    llvm::PointerType *m_llvm_type_ustring_ptr;
+    llvm::PointerType *m_llvm_type_char_ptr;
+    llvm::PointerType *m_llvm_type_int_ptr;
+    llvm::PointerType *m_llvm_type_float_ptr;
+    llvm::PointerType *m_llvm_type_triple_ptr;
+    llvm::PointerType *m_llvm_type_matrix_ptr;
+
 };
 
 
 
+}; // namespace pvt
 OSL_NAMESPACE_EXIT
-
-
-#endif

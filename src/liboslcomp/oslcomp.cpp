@@ -37,20 +37,33 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "oslcomp_pvt.h"
 
-#include <OpenImageIO/strutil.h>
+#include <OpenImageIO/platform.h>
 #include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/thread.h>
 
-#include <boost/foreach.hpp>
-
-#include <boost/wave.hpp>
-#include <boost/wave/cpplexer/cpp_lex_token.hpp>
-#include <boost/wave/cpplexer/cpp_lex_iterator.hpp>
-#if OIIO_VERSION < 10604
-#include <boost/filesystem.hpp>
+#ifndef USE_BOOST_WAVE
+# define USE_BOOST_WAVE 0
+#endif
+#if USE_BOOST_WAVE
+# include <boost/wave.hpp>
+# include <boost/wave/cpplexer/cpp_lex_token.hpp>
+# include <boost/wave/cpplexer/cpp_lex_iterator.hpp>
+#else
+# if !defined(__STDC_CONSTANT_MACROS)
+#   define __STDC_CONSTANT_MACROS 1
+# endif
+# include <clang/Frontend/CompilerInstance.h>
+# include <clang/Frontend/TextDiagnosticPrinter.h>
+# include <clang/Frontend/Utils.h>
+# include <clang/Basic/TargetInfo.h>
+# include <clang/Lex/PreprocessorOptions.h>
+# include <llvm/Support/ToolOutputFile.h>
+# include <llvm/Support/Host.h>
+# include <llvm/Support/MemoryBuffer.h>
+# include <llvm/Support/raw_ostream.h>
 #endif
 
 
@@ -118,7 +131,7 @@ OSLCompilerImpl::OSLCompilerImpl (ErrorHandler *errhandler)
       m_verbose(false), m_quiet(false), m_debug(false),
       m_preprocess_only(false), m_optimizelevel(1),
       m_next_temp(0), m_next_const(0),
-      m_osofile(NULL), m_sourcefile(NULL), m_last_sourceline(0),
+      m_osofile(NULL),
       m_total_nesting(0), m_loop_nesting(0), m_derivsym(NULL),
       m_main_method_start(-1),
       m_declaring_shader_formals(false)
@@ -131,10 +144,6 @@ OSLCompilerImpl::OSLCompilerImpl (ErrorHandler *errhandler)
 
 OSLCompilerImpl::~OSLCompilerImpl ()
 {
-    if (m_sourcefile) {
-        fclose (m_sourcefile);
-        m_sourcefile = NULL;
-    }
     delete m_derivsym;
 }
 
@@ -199,6 +208,8 @@ OSLCompilerImpl::preprocess_file (const std::string &filename,
 }
 
 
+
+#if USE_BOOST_WAVE
 
 bool
 OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
@@ -293,6 +304,110 @@ OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
 }
 
 
+#else /* LLVM: vvvvvvvvvv */
+
+bool
+OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
+                                    const std::string &filename,
+                                    const std::string &stdoslpath,
+                                    const std::vector<std::string> &defines,
+                                    const std::vector<std::string> &includepaths,
+                                    std::string &result)
+{
+    std::string instring;
+    if (!stdoslpath.empty())
+        instring = OIIO::Strutil::format("#include \"%s\"\n", stdoslpath);
+    else
+        instring = "\n";
+    instring += buffer;
+    std::unique_ptr<llvm::MemoryBuffer> mbuf (llvm::MemoryBuffer::getMemBuffer(instring, filename));
+
+    clang::CompilerInstance inst;
+
+#if 1
+    inst.createDiagnostics();
+#else
+    // I think these are unnecessary?
+    llvm::raw_fd_ostream stderrRaw(2, false);
+    clang::DiagnosticOptions *diagOptions = new clang::DiagnosticOptions();
+    clang::TextDiagnosticPrinter *diagPrinter =
+        new clang::TextDiagnosticPrinter(stderrRaw, diagOptions);
+    llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(new clang::DiagnosticIDs);
+    clang::DiagnosticsEngine *diagEngine =
+        new clang::DiagnosticsEngine(diagIDs, diagOptions, diagPrinter);
+    inst.setDiagnostics(diagEngine);
+#endif
+
+#if OSL_LLVM_VERSION <= 34
+    clang::TargetOptions &targetopts = inst.getTargetOpts();
+    targetopts.Triple = llvm::sys::getDefaultTargetTriple();
+    clang::TargetInfo *target =
+        clang::TargetInfo::CreateTargetInfo(inst.getDiagnostics(), &targetopts);
+#else // LLVM 3.5+
+    const std::shared_ptr<clang::TargetOptions> &targetopts =
+          std::make_shared<clang::TargetOptions>(inst.getTargetOpts());
+    targetopts->Triple = llvm::sys::getDefaultTargetTriple();
+    clang::TargetInfo *target =
+        clang::TargetInfo::CreateTargetInfo(inst.getDiagnostics(), targetopts);
+#endif
+
+    inst.setTarget(target);
+
+    inst.createFileManager();
+    inst.createSourceManager(inst.getFileManager());
+#if OSL_LLVM_VERSION <= 35
+    clang::FrontendInputFile inputFile(mbuf.release(), clang::IK_None);
+    inst.InitializeSourceManager(inputFile);
+#else
+    clang::SourceManager &sm = inst.getSourceManager();
+    sm.setMainFileID (sm.createFileID(std::move(mbuf), clang::SrcMgr::C_User));
+#endif
+
+    inst.getPreprocessorOutputOpts().ShowCPP = 1;
+    inst.getPreprocessorOutputOpts().ShowMacros = 0;
+
+    clang::HeaderSearchOptions &headerOpts = inst.getHeaderSearchOpts();
+    headerOpts.UseBuiltinIncludes = 0;
+    headerOpts.UseStandardSystemIncludes = 0;
+    headerOpts.UseStandardCXXIncludes = 0;
+    std::string directory = OIIO::Filesystem::parent_path(filename);
+    if (directory.empty())
+        directory = OIIO::Filesystem::current_path();
+    headerOpts.AddPath (directory, clang::frontend::Angled, false, true);
+    for (auto&& inc : includepaths) {
+        headerOpts.AddPath (inc, clang::frontend::Angled,
+                            false /* not a framework */,
+                            true /* ignore sys root */);
+    }
+
+    clang::PreprocessorOptions &preprocOpts = inst.getPreprocessorOpts();
+    preprocOpts.UsePredefines = 0;
+    for (auto&& d : defines) {
+        if (d[1] == 'D')
+            preprocOpts.addMacroDef (d.c_str()+2);
+        else if (d[1] == 'U')
+            preprocOpts.addMacroUndef (d.c_str()+2);
+    }
+
+    inst.getLangOpts().LineComment = 1;
+
+#if OSL_LLVM_VERSION >= 35
+    inst.createPreprocessor(clang::TU_Prefix);
+#else
+    inst.createPreprocessor();
+#endif
+
+    llvm::raw_string_ostream ostream(result);
+    // diagPrinter->BeginSourceFile (inst.getLangOpts(), &inst.getPreprocessor());
+    clang::DoPrintPreprocessedInput (inst.getPreprocessor(),
+                                     &ostream, inst.getPreprocessorOutputOpts());
+    // diagPrinter->EndSourceFile ();
+    return true;
+}
+
+#endif
+
+
 
 void
 OSLCompilerImpl::read_compile_options (const std::vector<std::string> &options,
@@ -346,11 +461,7 @@ OSLCompilerImpl::compile (string_view filename,
 
     std::vector<std::string> defines;
     std::vector<std::string> includepaths;
-#if OIIO_VERSION >= 10604
     m_cwd = OIIO::Filesystem::current_path();
-#else
-    m_cwd = boost::filesystem::current_path().string();
-#endif
     m_main_filename = filename;
 
     // Determine where the installed shader include directory is, and
@@ -441,11 +552,7 @@ OSLCompilerImpl::compile_buffer (string_view sourcecode,
 {
     string_view filename ("<buffer>");
 
-#if OIIO_VERSION >= 10604
     m_cwd = OIIO::Filesystem::current_path();
-#else
-    m_cwd = boost::filesystem::current_path().string();
-#endif
     m_main_filename = filename;
 
     // Determine where the installed shader include directory is, and
@@ -713,7 +820,7 @@ OSLCompilerImpl::write_oso_symbol (const Symbol *sym)
         // FIXME
         const SymPtrSet &deps (m_symdeps[sym]);
         std::vector<const Symbol *> inputdeps;
-        BOOST_FOREACH (const Symbol *d, deps)
+        for (auto&& d : deps)
             if (d->symtype() == SymTypeParam ||
                   d->symtype() == SymTypeOutputParam ||
                   d->symtype() == SymTypeGlobal ||
@@ -767,12 +874,12 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
     oso ("\n");
 
     // Output params, so they are first
-    BOOST_FOREACH (const Symbol *s, symtab()) {
+    for (auto&& s : symtab()) {
         if (s->symtype() == SymTypeParam || s->symtype() == SymTypeOutputParam)
             write_oso_symbol (s);
     }
     // Output globals, locals, temps, const
-    BOOST_FOREACH (const Symbol *s, symtab()) {
+    for (auto&& s : symtab()) {
         if (s->symtype() == SymTypeLocal || s->symtype() == SymTypeTemp ||
             s->symtype() == SymTypeGlobal || s->symtype() == SymTypeConst) {
             // Don't bother writing symbols that are never used
@@ -856,7 +963,11 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
         // %argderivs documents which arguments have derivs taken of
         // them by the op.
         if (op->argtakesderivs_all()) {
+#if OIIO_VERSION >= 10803
             oso (" %%argderivs{");
+#else
+            oso (" %cargderivs{", '%');  // trick to work with older OIIO
+#endif
             int any = 0;
             for (int i = 0;  i < op->nargs();  ++i)
                 if (op->argtakesderivs(i)) {
@@ -885,38 +996,25 @@ OSLCompilerImpl::retrieve_source (ustring filename, int line)
 {
     // If we don't already have the file open, open it
     if (filename != m_last_sourcefile) {
-        // If we have another file open, close that one
-        if (m_sourcefile)
-            fclose (m_sourcefile);
-        m_last_sourcefile = filename;
-        m_sourcefile = OIIO::Filesystem::fopen (filename, "r");
-        if (! m_sourcefile) {
+        bool ok = OIIO::Filesystem::read_text_file (filename, m_filecontents);
+        if (ok) {
+            m_last_sourcefile = filename;
+        } else {
             m_last_sourcefile = ustring();
-            return "<not found>";
+            return "<file not found>";
         }
     }
 
-    // If we want something *before* the last line read in the open file,
-    // rewind to the beginning.
-    if (m_last_sourceline > line) {
-        rewind (m_sourcefile);
-        m_last_sourceline = 0;
-    }
-
     // Now read lines up to and including the file we want.
-    char buf[10240];
-    while (m_last_sourceline < line) {
-        if (fgets (buf, sizeof(buf), m_sourcefile))
-            ++m_last_sourceline;
-        else
-            break;
+    OIIO::string_view s (m_filecontents);
+    for ( ; line > 1; --line) {
+        size_t p = s.find_first_of ('\n');
+        if (p == OIIO::string_view::npos)
+            return "<line not found>";
+        s.remove_prefix (p+1);
     }
-
-    // strip trailing newline
-    if (buf[strlen(buf)-1] == '\n')
-        buf[strlen(buf)-1] = '\0';
-
-    return std::string (buf);
+    s = s.substr (0, s.find_first_of ('\n'));
+    return s;
 }
 
 
@@ -1032,7 +1130,7 @@ OSLCompilerImpl::check_for_illegal_writes ()
 {
     // For each op, make sure any arguments it writes are legal to do so
     int opnum = 0;
-    BOOST_FOREACH (Opcode &op, m_ircode) {
+    for (auto&& op : m_ircode) {
         for (int a = 0;  a < op.nargs();  ++a) {
             SymbolPtr s = m_opargs[op.firstarg()+a];
             if (op.argwrite(a))
@@ -1054,7 +1152,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
                                            std::vector<int> *bblockids)
 {
     // Clear the lifetimes for all symbols
-    BOOST_FOREACH (Symbol *s, allsyms)
+    for (auto&& s : allsyms)
         s->clear_rw ();
 
     // Keep track of the nested loops we're inside. We track them by pairs
@@ -1066,7 +1164,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
 
     // For each op, mark its arguments as being used at that op
     int opnum = 0;
-    BOOST_FOREACH (const Opcode &op, code) {
+    for (auto&& op : code) {
         if (op.opname() == op_for || op.opname() == op_while ||
                 op.opname() == op_dowhile) {
             // If this is a loop op, we need to mark its control variable
@@ -1093,7 +1191,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
 
             // Adjust lifetimes of symbols whose values need to be preserved
             // between loop iterations.
-            BOOST_FOREACH (intpair oprange, loop_bounds) {
+            for (auto oprange : loop_bounds) {
                 int loopcond = oprange.first;
                 int loopend = oprange.second;
                 DASSERT (s->firstuse() <= loopend);
@@ -1141,7 +1239,7 @@ add_dependency (SymDependencyMap &dmap, const Symbol *A, const Symbol *B)
 #ifdef DEBUG_SYMBOL_DEPENDENCIES
     // Perform unification -- all of B's dependencies are now
     // dependencies of A.
-    BOOST_FOREACH (const Symbol *r, dmap[B])
+    for (auto&& r : dmap[B])
         dmap[A].insert (r);
 #endif
 }
@@ -1150,7 +1248,7 @@ add_dependency (SymDependencyMap &dmap, const Symbol *A, const Symbol *B)
 static void
 mark_symbol_derivatives (SymDependencyMap &dmap, SymPtrSet &visited, const Symbol *sym)
 {
-    BOOST_FOREACH (const Symbol *r, dmap[sym]) {
+    for (auto&& r : dmap[sym]) {
 		if (visited.find(r) == visited.end()) {
 			visited.insert(r);
 
@@ -1219,9 +1317,9 @@ OSLCompilerImpl::track_variable_dependencies ()
 
         bool deriv = op->argtakesderivs_all();
         // For each sym written by the op...
-        BOOST_FOREACH (const Symbol *wsym, written) {
+        for (auto&& wsym : written) {
             // For each sym read by the op...
-            BOOST_FOREACH (const Symbol *rsym, read) {
+            for (auto&& rsym : read) {
                 if (rsym->symtype() != SymTypeConst)
                     add_dependency (m_symdeps, wsym, rsym);
             }
@@ -1245,9 +1343,9 @@ OSLCompilerImpl::track_variable_dependencies ()
 
     std::cerr << "track_variable_dependencies\n";
     std::cerr << "\nDependencies:\n";
-    BOOST_FOREACH (SymDependencyMap::value_type &m, m_symdeps) {
+    for (auto&& m, m_symdeps) {
         std::cerr << m.first->mangled() << " depends on ";
-        BOOST_FOREACH (const Symbol *d, m.second)
+        for (auto&& d : m.second)
             std::cerr << d->mangled() << ' ';
         std::cerr << "\n";
     }
@@ -1255,14 +1353,14 @@ OSLCompilerImpl::track_variable_dependencies ()
 
     // Invert the dependency
     SymDependencyMap influences;
-    BOOST_FOREACH (SymDependencyMap::value_type &m, m_symdeps)
-        BOOST_FOREACH (const Symbol *d, m.second)
+    for (auto&& m, m_symdeps)
+        for (auto&& d : m.second)
             influences[d].insert (m.first);
 
     std::cerr << "\nReverse dependencies:\n";
-    BOOST_FOREACH (SymDependencyMap::value_type &m, influences) {
+    for (auto&& m, influences) {
         std::cerr << m.first->mangled() << " contributes to ";
-        BOOST_FOREACH (const Symbol *d, m.second)
+        for (auto&& d : m.second)
             std::cerr << d->mangled() << ' ';
         std::cerr << "\n";
     }

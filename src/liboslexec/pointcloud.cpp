@@ -32,7 +32,7 @@ using namespace OSL::pvt;
 
 #if USE_PARTIO
 #include <Partio.h>
-#include <boost/unordered_map.hpp>
+#include <unordered_map>
 #endif
 
 
@@ -47,7 +47,7 @@ public:
     ~PointCloud ();
     static PointCloud *get (ustring filename, bool write = false);
 
-    typedef boost::unordered_map<ustring, shared_ptr<Partio::ParticleAttribute>, ustringHash> AttributeMap;
+    typedef std::unordered_map<ustring, std::shared_ptr<Partio::ParticleAttribute>, ustringHash> AttributeMap;
     // N.B./FIXME(C++11): shared_ptr is probably overkill, but
     // scoped_ptr is not copyable and therefore can't be used in
     // standard containers.  When C++11 is uniquitous, unique_ptr is the
@@ -69,7 +69,7 @@ public:
 };
 
 
-typedef boost::unordered_map<ustring, shared_ptr<PointCloud>, ustringHash> PointCloudMap;
+typedef std::unordered_map<ustring, std::shared_ptr<PointCloud>, ustringHash> PointCloudMap;
 // See above note about shared_ptr vs unique_ptr.
 static PointCloudMap pointclouds;
 static spin_mutex pointcloudmap_mutex;
@@ -269,14 +269,20 @@ RendererServices::pointcloud_search (ShaderGlobals *sg,
             float *d_distance_dx = out_distances + derivs_offset;
             float *d_distance_dy = out_distances + derivs_offset * 2;
             for (int i = 0; i < count; ++i) {
-                d_distance_dx[i] = 1.0f / out_distances[i] *
-                                        ((center.x - positions[i].x) * dCdx.x +
-                                         (center.y - positions[i].y) * dCdx.y +
-                                         (center.z - positions[i].z) * dCdx.z);
-                d_distance_dy[i] = 1.0f / out_distances[i] *
-                                        ((center.x - positions[i].x) * dCdy.x +
-                                         (center.y - positions[i].y) * dCdy.y +
-                                         (center.z - positions[i].z) * dCdy.z);
+                if (out_distances[i] > 0) {
+                    d_distance_dx[i] = 1.0f / out_distances[i] *
+                                            ((center.x - positions[i].x) * dCdx.x +
+                                             (center.y - positions[i].y) * dCdx.y +
+                                             (center.z - positions[i].z) * dCdx.z);
+                    d_distance_dy[i] = 1.0f / out_distances[i] *
+                                            ((center.x - positions[i].x) * dCdy.x +
+                                             (center.y - positions[i].y) * dCdy.y +
+                                             (center.z - positions[i].z) * dCdy.z);
+                } else {
+                    // distance is 0, derivs would be infinite which could cause trouble downstream
+                    d_distance_dx[i] = 0;
+                    d_distance_dy[i] = 0;
+                }
             }
         }
     }

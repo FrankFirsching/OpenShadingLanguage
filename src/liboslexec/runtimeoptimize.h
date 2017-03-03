@@ -32,12 +32,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <map>
 #include <set>
 
-#include <boost/version.hpp>
-#if BOOST_VERSION >= 104900
-# include <boost/container/flat_map.hpp>
-# include <boost/container/flat_set.hpp>
-# define USE_FLAT_MAP 1
-#endif
+#include <boost/container/flat_map.hpp>
+#include <boost/container/flat_set.hpp>
+#define USE_FLAT_MAP 1
 
 #include "oslexec_pvt.h"
 using namespace OSL;
@@ -156,9 +153,17 @@ public:
     int turn_into_nop (int begin, int end, string_view why=NULL);
 
     void debug_opt_impl (string_view message) const;
+#if OIIO_VERSION >= 10803
+    template<typename... Args>
+    inline void debug_opt (string_view fmt, const Args&... args) const {
+        debug_opt_impl (Strutil::format (fmt, args...));
+    }
+#else
     TINYFORMAT_WRAP_FORMAT (void, debug_opt, const,
                             std::ostringstream msg;, msg,
                             debug_opt_impl(msg.str());)
+#endif
+
     void debug_opt_ops (int opbegin, int opend, string_view message) const;
     void debug_turn_into (const Opcode &op, int numops,
                           string_view newop, int newarg0,
@@ -421,7 +426,7 @@ private:
     ShaderGlobals m_shaderglobals;        ///< Dummy ShaderGlobals
 
     // Keep track of some things for the whole shader group:
-    typedef boost::unordered_map<ustring,ustring,ustringHash> ustringmap_t;
+    typedef std::unordered_map<ustring,ustring,ustringHash> ustringmap_t;
     std::vector<ustringmap_t> m_params_holding_globals;
                    ///< Which params of each layer really just hold globals
 
