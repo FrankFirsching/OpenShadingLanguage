@@ -31,7 +31,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/fmath.h>
 
 #include "oslexec_pvt.h"
-#include "OSL/genclosure.h"
+#include <OSL/genclosure.h>
 #include "backendllvm.h"
 
 using namespace OSL;
@@ -57,8 +57,10 @@ static ustring op_fabs("fabs");
 static ustring op_floor("floor");
 static ustring op_for("for");
 static ustring op_format("format");
+static ustring op_fprintf("fprintf");
 static ustring op_ge("ge");
 static ustring op_gt("gt");
+static ustring op_hashnoise("hashnoise");
 static ustring op_if("if");
 static ustring op_le("le");
 static ustring op_logb("logb");
@@ -155,10 +157,8 @@ BackendLLVM::llvm_call_layer (int layer, bool unconditional)
         // insert point is now then_block
     }
 
-    std::string name = Strutil::format ("%s_%d", parent->layername().c_str(),
-                                        parent->id());
     // Mark the call as a fast call
-    llvm::Value *funccall = ll.call_function (name.c_str(), args, 2);
+    llvm::Value *funccall = ll.call_function (layer_function_name(group(), *parent).c_str(), args, 2);
     if (!parent->entry_layer())
         ll.mark_fast_func_call (funccall);
 
@@ -255,7 +255,7 @@ LLVMGEN (llvm_gen_useparam)
 
 
 
-// Used for printf, error, warning, format
+// Used for printf, error, warning, format, fprintf
 LLVMGEN (llvm_gen_printf)
 {
     Opcode &op (rop.inst()->ops()[opnum]);
@@ -263,8 +263,8 @@ LLVMGEN (llvm_gen_printf)
     // Prepare the args for the call
     
     // Which argument is the format string?  Usually 0, but for op
-    // format(), the formatting string is argument #1.
-    int format_arg = (op.opname() == "format" ? 1 : 0);
+    // format() and fprintf(), the formatting string is argument #1.
+    int format_arg = (op.opname() == "format" || op.opname() == "fprintf") ? 1 : 0;
     Symbol& format_sym = *rop.opargsym (op, format_arg);
 
     std::vector<llvm::Value*> call_args;
@@ -276,8 +276,15 @@ LLVMGEN (llvm_gen_printf)
 
     // For some ops, we push the shader globals pointer
     if (op.opname() == op_printf || op.opname() == op_error ||
-            op.opname() == op_warning)
+            op.opname() == op_warning || op.opname() == op_fprintf)
         call_args.push_back (rop.sg_void_ptr());
+
+    // fprintf also needs the filename
+    if (op.opname() == op_fprintf) {
+        Symbol& Filename = *rop.opargsym (op, 0);
+        llvm::Value* fn = rop.llvm_load_value (Filename);
+        call_args.push_back (fn);
+    }
 
     // We're going to need to adjust the format string as we go, but I'd
     // like to reserve a spot for the char*.
@@ -314,6 +321,8 @@ LLVMGEN (llvm_gen_printf)
             std::string ourformat (oldfmt, format);  // straddle the format
             // Doctor it to fix mismatches between format and data
             Symbol& sym (*rop.opargsym (op, arg));
+            ASSERT (! sym.typespec().is_structure_based());
+
             TypeDesc simpletype (sym.typespec().simpletype());
             int num_elements = simpletype.numelements();
             int num_components = simpletype.aggregate;
@@ -349,10 +358,22 @@ LLVMGEN (llvm_gen_printf)
                         s += " ";
                     s += ourformat;
 
-                    llvm::Value* loaded = rop.llvm_load_value (sym, 0, arrind, c);
+                    // In the OptiX case, we need to use the device-side string constant,
+                    // as added to the LLVM Module.
+                    llvm::Value* loaded = (simpletype.basetype == TypeDesc::STRING &&
+                                           sym.is_constant() && rop.use_optix())
+                        ? rop.getOrAllocateLLVMGlobal (sym)
+                        : rop.llvm_load_value (sym, 0, arrind, c);
+
                     if (simpletype.basetype == TypeDesc::FLOAT) {
                         // C varargs convention upconverts float->double.
                         loaded = rop.ll.op_float_to_double(loaded);
+                    }
+
+                    if (simpletype.basetype == TypeDesc::INT && rop.use_optix()) {
+                        // The printf supported by OptiX expects 8-byte arguments,
+                        // so promote int to long long
+                        loaded = rop.ll.op_int_to_longlong(loaded);
                     }
 
                     call_args.push_back (loaded);
@@ -374,7 +395,11 @@ LLVMGEN (llvm_gen_printf)
     }
 
     // Now go back and put the new format string in its place
-    call_args[new_format_slot] = rop.ll.constant (s.c_str());
+    call_args[new_format_slot] = (! rop.use_optix())
+        ? rop.ll.constant (s.c_str())
+        // In the OptiX case, we need to use the pointer to the constant format
+        // string added to the LLVM Module
+        : rop.llvm_get_pointer (format_sym);
 
     // Construct the function name and call it.
     std::string opname = std::string("osl_") + op.opname().string();
@@ -1327,9 +1352,24 @@ LLVMGEN (llvm_gen_aassign)
     }
 
     int num_components = Result.typespec().simpletype().aggregate;
+
+    // Allow float <=> int casting
+    TypeDesc cast;
+    if (num_components == 1 && !Result.typespec().is_closure() && !Src.typespec().is_closure() &&
+        (Result.typespec().is_int_based() ||  Result.typespec().is_float_based()) &&
+        (Src.typespec().is_int_based() ||  Src.typespec().is_float_based())) {
+        cast = Result.typespec().simpletype();
+        cast.arraylen = 0;
+    } else {
+        // Try to warn before llvm_fatal_error is called which provides little
+        // context as to what went wrong.
+        ASSERT (Result.typespec().simpletype().basetype ==
+                Src.typespec().simpletype().basetype);
+    }
+
     for (int d = 0;  d <= 2;  ++d) {
         for (int c = 0;  c < num_components;  ++c) {
-            llvm::Value *val = rop.loadLLVMValue (Src, c, d);
+            llvm::Value *val = rop.loadLLVMValue (Src, c, d, cast);
             rop.llvm_store_value (val, Result, d, index, c);
         }
         if (! Result.has_derivs())
@@ -1587,6 +1627,26 @@ LLVMGEN (llvm_gen_transform)
 
 
 
+// transformc (string fromspace, string tospace, color p)
+LLVMGEN (llvm_gen_transformc)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    ASSERT (op.nargs() == 4);
+    Symbol *Result = rop.opargsym (op, 0);
+    Symbol *From = rop.opargsym (op, 1);
+    Symbol *To = rop.opargsym (op, 2);
+    Symbol *C = rop.opargsym (op, 3);
+
+    llvm::Value *args[] = { rop.sg_void_ptr(),
+        rop.llvm_void_ptr(*C), rop.ll.constant(C->has_derivs()),
+        rop.llvm_void_ptr(*Result), rop.ll.constant(Result->has_derivs()),
+        rop.llvm_load_value(*From), rop.llvm_load_value(*To) };
+    rop.ll.call_function ("osl_transformc", args);
+    return true;
+}
+
+
+
 // Derivs
 LLVMGEN (llvm_gen_DxDy)
 {
@@ -1690,6 +1750,33 @@ LLVMGEN (llvm_gen_compare_op)
 
     llvm::Value* final_result = 0;
     ustring opname = op.opname();
+
+    if (rop.use_optix() && A.typespec().is_string()) {
+        // Compare two strings for equality by comparing the pointers to
+        // their global constants.
+
+        ASSERT (B.typespec().is_string() && "Only string-to-string comparison is supported");
+
+        llvm::Value* a = (A.is_constant())
+            ? rop.llvm_get_pointer (A) : rop.llvm_load_value (A);
+
+        llvm::Value* b = (B.is_constant())
+            ? rop.llvm_get_pointer (B) : rop.llvm_load_value (B);
+
+        if (opname == op_eq) {
+            final_result = rop.ll.op_eq (a, b);
+        } else if (opname == op_neq) {
+            final_result = rop.ll.op_ne (a, b);
+        } else {
+            // Don't know how to handle this.
+            ASSERT (0 && "OptiX only supports equality testing for strings");
+        }
+        ASSERT (final_result);
+
+        final_result = rop.ll.op_bool_to_int (final_result);
+        rop.storeLLVMValue (final_result, Result, 0, 0);
+        return true;
+    }
 
     for (int i = 0; i < num_components; i++) {
         // Get A&B component i -- note that these correctly handle mixed
@@ -2171,6 +2258,12 @@ llvm_gen_texture_options (BackendLLVM &rop, int opnum,
         PARAM_INT (subimage)
 
         if (name == Strings::subimage && valtype == TypeDesc::STRING) {
+            if (Val.is_constant()) {
+                ustring v = *(ustring *)Val.data();
+                if (! v && ! subimage_set) {
+                    continue;     // Ignore nulls unless they are overrides
+                }
+            }
             llvm::Value *val = rop.llvm_load_value (Val);
             rop.ll.call_function ("osl_texture_set_subimagename", opt, val);
             subimage_set = true;
@@ -2677,6 +2770,9 @@ LLVMGEN (llvm_gen_noise)
     } else if (name == Strings::cell || name == Strings::cellnoise) {
         name = periodic ? Strings::pcellnoise : Strings::cellnoise;
         derivs = false;  // cell noise derivs are always zero
+    } else if (name == Strings::hash || name == Strings::hashnoise) {
+        name = periodic ? Strings::phashnoise : Strings::hashnoise;
+        derivs = false;  // hash noise derivs are always zero
     } else if (name == Strings::simplex && !periodic) {
         name = Strings::simplexnoise;
     } else if (name == Strings::usimplex && !periodic) {
@@ -2702,6 +2798,7 @@ LLVMGEN (llvm_gen_noise)
         if (name == Strings::uperlin || name == Strings::noise ||
             name == Strings::usimplexnoise || name == Strings::usimplex ||
             name == Strings::cell || name == Strings::cellnoise ||
+            name == Strings::hash || name == Strings::hashnoise ||
             name == Strings::pcellnoise || name == Strings::pnoise)
             name = ustring("unullnoise");
         else

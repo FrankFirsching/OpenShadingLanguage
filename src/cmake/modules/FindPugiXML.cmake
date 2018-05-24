@@ -6,12 +6,27 @@
 # PUGIXML_LIBRARIES - library to link against
 # PUGIXML_FOUND - true if pugixml was found.
 
+unset (PUGIXML_LIBRARY CACHE)
+unset (PUGIXML_INCLUDE_DIR CACHE)
 find_path (PUGIXML_INCLUDE_DIR
            NAMES pugixml.hpp
-           PATHS ${PUGIXML_HOME}/include)
+           PATHS ${PUGIXML_HOME}/include
+           /usr/local/include
+           /usr/local/include/pugixml-1.8)
 find_library (PUGIXML_LIBRARY
               NAMES pugixml
-              PATHS ${PUGIXML_HOME}/lib)
+              PATHS ${PUGIXML_HOME}/lib
+              /usr/local/lib
+              /usr/local/lib/pugixml-1.8)
+
+# Second chance -- if not found, look in the OIIO distro
+if (NOT PUGIXML_INCLUDE_DIR AND OPENIMAGEIO_INCLUDE_DIR)
+    find_path (PUGIXML_INCLUDE_DIR
+               NAMES pugixml.hpp
+               PATHS ${OPENIMAGEIO_INCLUDE_DIR}/OpenImageIO)
+    set (PUGIXML_LIBRARY ${OPENIMAGEIO_LIBRARIES})
+endif ()
+
 
 # Support the REQUIRED and QUIET arguments, and set PUGIXML_FOUND if found.
 include (FindPackageHandleStandardArgs)

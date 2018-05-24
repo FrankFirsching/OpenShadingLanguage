@@ -33,10 +33,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <set>
 #include <map>
 
-#include "OSL/oslcomp.h"
+#include <OSL/oslcomp.h>
 #include "ast.h"
 #include "symtab.h"
-#include "OSL/genclosure.h"
+#include <OSL/genclosure.h>
 
 
 extern int oslparse ();
@@ -99,12 +99,71 @@ public:
     ErrorHandler &errhandler () const { return *m_errhandler; }
 
     /// Error reporting
-    ///
-    void error (ustring filename, int line, const char *format, ...) const;
+    template<typename... Args>
+    void error (ustring filename, int line,
+                string_view format, const Args&... args) const
+    {
+        ASSERT (format.size());
+        std::string msg = OIIO::Strutil::format (format, args...);
+        if (msg.size() && msg.back() == '\n')  // trim extra newline
+            msg.pop_back();
+        if (filename.size())
+            m_errhandler->error ("%s:%d: error: %s", filename, line, msg);
+        else
+            m_errhandler->error ("error: %s", msg);
+        m_err = true;
+    }
 
     /// Warning reporting
-    ///
-    void warning (ustring filename, int line, const char *format, ...) const;
+    template<typename... Args>
+    void warning (ustring filename, int line,
+                  string_view format, const Args&... args) const
+    {
+        ASSERT (format.size());
+        if (nowarn(filename, line))
+            return;    // skip if the filename/line is on the nowarn list
+        std::string msg = OIIO::Strutil::format (format, args...);
+        if (msg.size() && msg.back() == '\n')  // trim extra newline
+            msg.pop_back();
+        if (m_err_on_warning) {
+            error (filename, line, "%s", msg);
+            return;
+        }
+        if (filename.size())
+            m_errhandler->warning ("%s:%d: warning: %s", filename, line, msg);
+        else
+            m_errhandler->warning ("warning: %s", msg);
+    }
+
+    /// Info reporting
+    template<typename... Args>
+    void info (ustring filename, int line,
+                  string_view format, const Args&... args) const
+    {
+        ASSERT (format.size());
+        std::string msg = OIIO::Strutil::format (format, args...);
+        if (msg.size() && msg.back() == '\n')  // trim extra newline
+            msg.pop_back();
+        if (filename.size())
+            m_errhandler->info ("%s:%d: info: %s", filename, line, msg);
+        else
+            m_errhandler->info ("info: %s", msg);
+    }
+
+    /// message reporting
+    template<typename... Args>
+    void message (ustring filename, int line,
+                  string_view format, const Args&... args) const
+    {
+        ASSERT (format.size());
+        std::string msg = OIIO::Strutil::format (format, args...);
+        if (msg.size() && msg.back() == '\n')  // trim extra newline
+            msg.pop_back();
+        if (filename.size())
+            m_errhandler->message ("%s:%d: %s", filename, line, msg);
+        else
+            m_errhandler->message ("%s", msg);
+    }
 
     /// Have we hit an error?
     ///
@@ -315,6 +374,23 @@ public:
 
     bool debug () const { return m_debug; }
 
+    /// As the compiler generates function declarations, we need to remember
+    /// them (with ref-counted pointers). They'll get freed automatically
+    /// when the compiler destructs.
+    void remember_function_decl (ASTfunction_declaration *f) {
+        m_func_decls.emplace_back (f);
+    }
+
+    // Add a pragma nowarn for the following line
+    void pragma_nowarn () {
+        m_nowarn_lines.insert ({filename(), lineno()+1});
+    }
+
+    // Is the line amont
+    bool nowarn (ustring filename, int line) const {
+        return m_nowarn_lines.find({filename, line}) != m_nowarn_lines.end();
+    }
+
 private:
     void initialize_globals ();
     void initialize_builtin_funcs ();
@@ -324,14 +400,10 @@ private:
     void write_oso_symbol (const Symbol *sym);
     void write_oso_metadata (const ASTNode *metanode) const;
 
-#if OIIO_VERSION >= 10803
     template<typename... Args>
     inline void oso (string_view fmt, const Args&... args) const {
         (*m_osofile) << OIIO::Strutil::format (fmt, args...);
     }
-#else
-    TINYFORMAT_WRAP_FORMAT (void, oso, const, , (*m_osofile), )
-#endif
 
     void track_variable_lifetimes () {
         track_variable_lifetimes (m_ircode, m_opargs, symtab().allsyms());
@@ -392,12 +464,14 @@ private:
     ErrorHandler *m_errhandler; ///< Error handler
     mutable bool m_err;       ///< Has an error occurred?
     SymbolTable m_symtab;     ///< Symbol table
+    std::vector<ASTNode::ref> m_func_decls; ///< Ref-counted function decls
     TypeSpec m_current_typespec;  ///< Currently-declared type
     bool m_current_output;        ///< Currently-declared output status
     bool m_verbose;           ///< Verbose mode
     bool m_quiet;             ///< Quiet mode
     bool m_debug;             ///< Debug mode
     bool m_preprocess_only;   ///< Preprocess only?
+    bool m_err_on_warning;    ///< Treat warnings as errors?
     int m_optimizelevel;      ///< Optimization level
     OpcodeVec m_ircode;       ///< Generated IR code
     SymbolPtrVec m_opargs;    ///< Arguments for all instructions
@@ -415,6 +489,7 @@ private:
     Symbol *m_derivsym;       ///< Pseudo-symbol to track deriv dependencies
     int m_main_method_start;  ///< Instruction where 'main' starts
     bool m_declaring_shader_formals; ///< Are we declaring shader formals?
+    std::set<std::pair<ustring,int>> m_nowarn_lines;  ///< Lines for 'nowarn'
 };
 
 

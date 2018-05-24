@@ -34,9 +34,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <mutex>
 
 #include "oslexec_pvt.h"
-#include "OSL/genclosure.h"
+#include <OSL/genclosure.h>
 #include "backendllvm.h"
-#include "OSL/oslquery.h"
+#include <OSL/oslquery.h>
 
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/dassert.h>
@@ -238,15 +238,6 @@ ShadingSystem::execute (ShadingContext *ctx, ShaderGroup &group,
 
 
 bool
-ShadingSystem::execute (ShadingContext &ctx, ShaderGroup &group,
-                        ShaderGlobals &globals, bool run)
-{
-    return m_impl->execute (&ctx, group, globals, run);
-}
-
-
-
-bool
 ShadingSystem::execute_init (ShadingContext &ctx, ShaderGroup &group,
                              ShaderGlobals &globals, bool run)
 {
@@ -388,10 +379,9 @@ void
 ShadingSystem::register_closure (string_view name, int id,
                                  const ClosureParam *params,
                                  PrepareClosureFunc prepare,
-                                 SetupClosureFunc setup,
-                                 int alignment)
+                                 SetupClosureFunc setup)
 {
-    return m_impl->register_closure (name, id, params, prepare, setup, alignment);
+    return m_impl->register_closure (name, id, params, prepare, setup);
 }
 
 
@@ -444,11 +434,19 @@ ShadingSystem::archive_shadergroup (ShaderGroup *group, string_view filename)
 }
 
 
+void
+ShadingSystem::set_raytypes (ShaderGroup *group, int raytypes_on, int raytypes_off)
+{
+    DASSERT (group);
+    group->set_raytypes(raytypes_on, raytypes_off);
+}
+
 
 void
 ShadingSystem::optimize_group (ShaderGroup *group)
 {
-    optimize_group (group, 0, 0);   // No knowledge of the ray flags
+    DASSERT (group);
+    m_impl->optimize_group (*group);
 }
 
 
@@ -457,13 +455,16 @@ void
 ShadingSystem::optimize_group (ShaderGroup *group,
                                int raytypes_on, int raytypes_off)
 {
-    ASSERT (group);
-    m_impl->optimize_group (*group, raytypes_on, raytypes_off);
+    // convenience function for backwards compatibility
+    set_raytypes (group, raytypes_on, raytypes_off);
+    optimize_group (group);
+
 }
 
 
 
 static TypeDesc TypeFloatArray2 (TypeDesc::FLOAT, 2);
+static TypeDesc TypeFloatArray3 (TypeDesc::FLOAT, 3);
 
 
 
@@ -523,6 +524,14 @@ ShadingSystem::convert_value (void *dst, TypeDesc dsttype,
             return true;
         }
         return false; // Unsupported conversion
+    }
+
+    // float[3] -> triple
+    if ((srctype == TypeFloatArray3 && equivalent(dsttype, TypeDesc::TypePoint)) ||
+        (dsttype == TypeFloatArray3 && equivalent(srctype, TypeDesc::TypePoint))) {
+        if (dst && src)
+            memcpy (dst, src, dsttype.size());
+        return true;
     }
 
     // float[2] -> triple
@@ -594,6 +603,7 @@ ustring cubic("cubic"), smartcubic("smartcubic");
 ustring perlin("perlin"), uperlin("uperlin");
 ustring noise("noise"), snoise("snoise");
 ustring cell("cell"), cellnoise("cellnoise"), pcellnoise("pcellnoise");
+ustring hash("hash"), hashnoise("hashnoise"), phashnoise("phashnoise");
 ustring pnoise("pnoise"), psnoise("psnoise");
 ustring genericnoise("genericnoise"), genericpnoise("genericpnoise");
 ustring gabor("gabor"), gabornoise("gabornoise"), gaborpnoise("gaborpnoise");
@@ -629,9 +639,11 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_lazy_userdata(false), m_userdata_isconnected(false),
       m_clearmemory (false), m_debugnan (false), m_debug_uninit(false),
       m_lockgeom_default (true), m_strict_messages(true),
+      m_error_repeats(false),
       m_range_checking(true),
       m_unknown_coordsys_error(true), m_connection_error(true),
       m_greedyjit(false), m_countlayerexecs(false),
+      m_relaxed_param_typecheck(false),
       m_max_warnings_per_thread(100),
       m_profile(0),
       m_optimize(2),
@@ -649,6 +661,7 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_llvm_optimize(0),
       m_debug(0), m_llvm_debug(0),
       m_llvm_debug_layers(0), m_llvm_debug_ops(0),
+      m_llvm_output_bitcode(0),
       m_commonspace_synonym("world"),
       m_colorspace("Rec709"),
       m_max_local_mem_KB(2048),
@@ -657,6 +670,7 @@ ShadingSystemImpl::ShadingSystemImpl (RendererServices *renderer,
       m_no_noise(false),
       m_no_pointcloud(false),
       m_force_derivs(false),
+      m_allow_shader_replacement(false),
       m_exec_repeat(1),
       m_in_group (false),
       m_stat_opt_locking_time(0), m_stat_specialization_time(0),
@@ -780,6 +794,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
                                                   constfold_##fold, simp, flag);
 #define OP(name,ll,fold,simp,flag) OP2(name,name,ll,fold,simp,flag)
 #define TEX OpDescriptor::Tex
+#define SIDE OpDescriptor::SideEffects
 
     // name          llvmgen              folder         simple     flags
     OP (aassign,     aassign,             aassign,       false,     0);
@@ -832,7 +847,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (eq,          compare_op,          eq,            true,      0);
     OP (erf,         generic,             erf,           true,      0);
     OP (erfc,        generic,             erfc,          true,      0);
-    OP (error,       printf,              none,          false,     0);
+    OP (error,       printf,              none,          false,     SIDE);
     OP (exit,        return,              none,          false,     0);
     OP (exp,         generic,             exp,           true,      0);
     OP (exp2,        generic,             exp2,          true,      0);
@@ -843,6 +858,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (fmod,        modulus,             none,          true,      0);
     OP (for,         loop_op,             none,          false,     0);
     OP (format,      printf,              format,        true,      0);
+    OP (fprintf,     printf,              none,          false,     SIDE);
     OP (functioncall, functioncall,       functioncall,  false,     0);
     OP (ge,          compare_op,          ge,            true,      0);
     OP (getattribute, getattribute,       getattribute,  false,     0);
@@ -852,6 +868,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (gettextureinfo, gettextureinfo,   gettextureinfo,false,     TEX);
     OP (gt,          compare_op,          gt,            true,      0);
     OP (hash,        generic,             hash,          true,      0);
+    OP (hashnoise,   noise,               noise,         true,      0);
     OP (if,          if,                  if,            false,     0);
     OP (inversesqrt, generic,             inversesqrt,   true,      0);
     OP (isconnected, generic,             none,          true,      0);
@@ -873,7 +890,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (mxcompref,   mxcompref,           none,          true,      0);
     OP (min,         minmax,              min,           true,      0);
     OP (mix,         mix,                 mix,           true,      0);
-    OP (mod,         modulus,             none,          true,      0);
+    OP (mod,         modulus,             mod,           true,      0);
     OP (mul,         mul,                 mul,           true,      0);
     OP (neg,         neg,                 neg,           true,      0);
     OP (neq,         compare_op,          neq,           true,      0);
@@ -887,9 +904,9 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (pointcloud_search, pointcloud_search, pointcloud_search,
                                                          false,     TEX);
     OP (pointcloud_get, pointcloud_get,   pointcloud_get,false,     TEX);
-    OP (pointcloud_write, pointcloud_write, none,        false,     0);
+    OP (pointcloud_write, pointcloud_write, none,        false,     SIDE);
     OP (pow,         generic,             pow,           true,      0);
-    OP (printf,      printf,              none,          false,     0);
+    OP (printf,      printf,              none,          false,     SIDE);
     OP (psnoise,     noise,               noise,         true,      0);
     OP (radians,     generic,             radians,       true,      0);
     OP (raytype,     raytype,             raytype,       true,      0);
@@ -898,7 +915,7 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (return,      return,              none,          false,     0);
     OP (round,       generic,             none,          true,      0);
     OP (select,      select,              select,        true,      0);
-    OP (setmessage,  setmessage,          setmessage,    false,     0);
+    OP (setmessage,  setmessage,          setmessage,    false,     SIDE);
     OP (shl,         bitwise_binary_op,   none,          true,      0);
     OP (shr,         bitwise_binary_op,   none,          true,      0);
     OP (sign,        generic,             none,          true,      0);
@@ -925,20 +942,22 @@ shading_system_setup_op_descriptors (ShadingSystemImpl::OpDescriptorMap& op_desc
     OP (tanh,        generic,             none,          true,      0);
     OP (texture,     texture,             texture,       true,      TEX);
     OP (texture3d,   texture3d,           none,          true,      TEX);
-    OP (trace,       trace,               none,          false,     0);
+    OP (trace,       trace,               none,          false,     SIDE);
     OP (transform,   transform,           transform,     true,      0);
+    OP (transformc,  transformc,          transformc,    true,      0);
     OP (transformn,  transform,           transform,     true,      0);
     OP (transformv,  transform,           transform,     true,      0);
     OP (transpose,   generic,             none,          true,      0);
     OP (trunc,       generic,             none,          true,      0);
     OP (useparam,    useparam,            useparam,      false,     0);
     OP (vector,      construct_triple,    triple,        true,      0);
-    OP (warning,     printf,              warning,       false,     0);
+    OP (warning,     printf,              warning,       false,     SIDE);
     OP (wavelength_color, blackbody,      none,          true,      0);
     OP (while,       loop_op,             none,          false,     0);
     OP (xor,         bitwise_binary_op,   xor,           true,      0);
 #undef OP
 #undef TEX
+#undef SIDE
 }
 
 
@@ -958,8 +977,7 @@ void
 ShadingSystemImpl::register_closure (string_view name, int id,
                                      const ClosureParam *params,
                                      PrepareClosureFunc prepare,
-                                     SetupClosureFunc setup,
-                                     int alignment)
+                                     SetupClosureFunc setup)
 {
     for (int i = 0; params && params[i].type != TypeDesc(); ++i) {
         if (params[i].key == NULL && params[i].type.size() != (size_t)params[i].field_size) {
@@ -967,7 +985,7 @@ ShadingSystemImpl::register_closure (string_view name, int id,
             return;
         }
     }
-    m_closure_registry.register_closure(name, id, params, prepare, setup, alignment);
+    m_closure_registry.register_closure(name, id, params, prepare, setup);
 }
 
 
@@ -1067,11 +1085,13 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
     ATTR_SET ("llvm_debug", int, m_llvm_debug);
     ATTR_SET ("llvm_debug_layers", int, m_llvm_debug_layers);
     ATTR_SET ("llvm_debug_ops", int, m_llvm_debug_ops);
+    ATTR_SET ("llvm_output_bitcode", int, m_llvm_output_bitcode);
     ATTR_SET ("strict_messages", int, m_strict_messages);
     ATTR_SET ("range_checking", int, m_range_checking);
     ATTR_SET ("unknown_coordsys_error", int, m_unknown_coordsys_error);
     ATTR_SET ("connection_error", int, m_connection_error);
     ATTR_SET ("greedyjit", int, m_greedyjit);
+    ATTR_SET ("relaxed_param_typecheck", int, m_relaxed_param_typecheck);
     ATTR_SET ("countlayerexecs", int, m_countlayerexecs);
     ATTR_SET ("max_warnings_per_thread", int, m_max_warnings_per_thread);
     ATTR_SET ("max_local_mem_KB", int, m_max_local_mem_KB);
@@ -1080,6 +1100,7 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
     ATTR_SET ("no_noise", int, m_no_noise);
     ATTR_SET ("no_pointcloud", int, m_no_pointcloud);
     ATTR_SET ("force_derivs", int, m_force_derivs);
+    ATTR_SET ("allow_shader_replacement", int, m_allow_shader_replacement);
     ATTR_SET ("exec_repeat", int, m_exec_repeat);
     ATTR_SET_STRING ("commonspace", m_commonspace_synonym);
     ATTR_SET_STRING ("debug_groupname", m_debug_groupname);
@@ -1108,15 +1129,28 @@ ShadingSystemImpl::attribute (string_view name, TypeDesc type,
                 "ShaderGlobals.raytype is an int, max of 32 raytypes");
         m_raytypes.clear ();
         for (size_t i = 0;  i < type.numelements();  ++i)
-            m_raytypes.push_back (ustring(((const char **)val)[i]));
+            m_raytypes.emplace_back(((const char **)val)[i]);
         return true;
     }
     if (name == "renderer_outputs" && type.basetype == TypeDesc::STRING) {
         m_renderer_outputs.clear ();
         for (size_t i = 0;  i < type.numelements();  ++i)
-            m_renderer_outputs.push_back (ustring(((const char **)val)[i]));
+            m_renderer_outputs.emplace_back(((const char **)val)[i]);
         return true;
     }
+    if (name == "lib_bitcode" && type.basetype == TypeDesc::UINT8) {
+        m_lib_bitcode.clear();
+        m_lib_bitcode = *static_cast<const std::vector<char>*>(val);
+        return true;
+    }
+    if (name == "error_repeats") {
+        // Special case: setting error_repeats also clears the "previously
+        // seen" error and warning lists.
+        m_errseen.clear();
+        m_warnseen.clear();
+        ATTR_SET ("error_repeats", int, m_error_repeats);
+    }
+
     return false;
 #undef ATTR_SET
 #undef ATTR_SET_STRING
@@ -1140,6 +1174,7 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     }
 
     lock_guard guard (m_mutex);  // Thread safety
+
     ATTR_DECODE_STRING ("searchpath:shader", m_searchpath);
     ATTR_DECODE ("statistics:level", int, m_statslevel);
     ATTR_DECODE ("lazylayers", int, m_lazylayers);
@@ -1176,12 +1211,15 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     ATTR_DECODE ("llvm_debug", int, m_llvm_debug);
     ATTR_DECODE ("llvm_debug_layers", int, m_llvm_debug_layers);
     ATTR_DECODE ("llvm_debug_ops", int, m_llvm_debug_ops);
+    ATTR_DECODE ("llvm_output_bitcode", int, m_llvm_output_bitcode);
     ATTR_DECODE ("strict_messages", int, m_strict_messages);
+    ATTR_DECODE ("error_repeats", int, m_error_repeats);
     ATTR_DECODE ("range_checking", int, m_range_checking);
     ATTR_DECODE ("unknown_coordsys_error", int, m_unknown_coordsys_error);
     ATTR_DECODE ("connection_error", int, m_connection_error);
     ATTR_DECODE ("greedyjit", int, m_greedyjit);
     ATTR_DECODE ("countlayerexecs", int, m_countlayerexecs);
+    ATTR_DECODE ("relaxed_param_typecheck", int, m_relaxed_param_typecheck);
     ATTR_DECODE ("max_warnings_per_thread", int, m_max_warnings_per_thread);
     ATTR_DECODE_STRING ("commonspace", m_commonspace_synonym);
     ATTR_DECODE_STRING ("colorspace", m_colorspace);
@@ -1197,6 +1235,7 @@ ShadingSystemImpl::getattribute (string_view name, TypeDesc type,
     ATTR_DECODE ("no_noise", int, m_no_noise);
     ATTR_DECODE ("no_pointcloud", int, m_no_pointcloud);
     ATTR_DECODE ("force_derivs", int, m_force_derivs);
+    ATTR_DECODE ("allow_shader_replacement", int, m_allow_shader_replacement);
     ATTR_DECODE ("exec_repeat", int, m_exec_repeat);
 
     ATTR_DECODE ("stat:masters", int, m_stat_shaders_loaded);
@@ -1279,7 +1318,7 @@ ShadingSystemImpl::attribute (ShaderGroup *group, string_view name,
     if (name == "renderer_outputs" && type.basetype == TypeDesc::STRING) {
         group->m_renderer_outputs.clear ();
         for (size_t i = 0;  i < type.numelements();  ++i)
-            group->m_renderer_outputs.push_back (ustring(((const char **)val)[i]));
+            group->m_renderer_outputs.emplace_back(((const char **)val)[i]);
         return true;
     }
     if (name == "entry_layers" && type.basetype == TypeDesc::STRING) {
@@ -1477,6 +1516,55 @@ ShadingSystemImpl::getattribute (ShaderGroup *group, string_view name,
         return true;
     }
 
+    // Additional atttributes useful to OptiX-based renderers
+    if (name == "userdata_layers" && type.basetype == TypeDesc::PTR) {
+        if (! group->optimized())
+            optimize_group (*group);
+        size_t n = group->m_userdata_layers.size();
+        *(int **)val = n ? &group->m_userdata_layers[0] : NULL;
+        return true;
+    }
+    if (name == "userdata_init_vals" && type.basetype == TypeDesc::PTR) {
+        if (! group->optimized())
+            optimize_group (*group);
+        size_t n = group->m_userdata_init_vals.size();
+        *(void **)val = n ? &group->m_userdata_init_vals[0] : NULL;
+        return true;
+    }
+    if (name == "ptx_compiled_version" && type.basetype == TypeDesc::PTR) {
+        bool exists = !group->m_llvm_ptx_compiled_version.empty();
+        *(std::string *)val = exists ? group->m_llvm_ptx_compiled_version : "";
+        return true;
+    }
+    if (name == "group_name" && type.basetype == TypeDesc::PTR) {
+        *(std::string *)val = group->name().string();
+        return true;
+    }
+    if (name == "group_id" && type == TypeDesc::TypeInt) {
+        if (! group->optimized())
+            optimize_group (*group);
+        *(int *)val = (int) group->id();
+        return true;
+    }
+    if (name == "group_init_name" && type.basetype == TypeDesc::PTR) {
+        *(std::string *)val = Strutil::format ("group_%d_init", group->id());
+        return true;
+    }
+    if (name == "group_entry_name" && type.basetype == TypeDesc::PTR) {
+        int nlayers = group->nlayers ();
+        ShaderInstance *inst = (*group)[nlayers-1];
+        // This formuation mirrors OSOProcessorBase::layer_function_name()
+        *(std::string *)val = Strutil::format ("%s_%s_%d", group->name(),
+                                               inst->layername(), inst->id());
+        return true;
+    }
+    if (name == "layer_osofiles" && type.basetype == TypeDesc::STRING) {
+        size_t n = std::min (type.numelements(), (size_t)group->nlayers());
+        for (size_t i = 0;  i < n;  ++i)
+            ((ustring *)val)[i] =(*group)[i]->master()->osofilename();
+        return true;
+    }
+
     return false;
 }
 
@@ -1488,7 +1576,7 @@ ShadingSystemImpl::error (const std::string &msg) const
     lock_guard guard (m_errmutex);
     int n = 0;
     for (auto&& s : m_errseen) {
-        if (s == msg)
+        if (s == msg && !m_error_repeats)
             return;
         ++n;
     }
@@ -1506,7 +1594,7 @@ ShadingSystemImpl::warning (const std::string &msg) const
     lock_guard guard (m_errmutex);
     int n = 0;
     for (auto&& s : m_warnseen) {
-        if (s == msg)
+        if (s == msg && !m_error_repeats)
             return;
         ++n;
     }
@@ -1570,11 +1658,12 @@ ShadingSystemImpl::getstats (int level) const
     if (level <= 0)
         return "";
     std::ostringstream out;
+    out.imbue (std::locale::classic());  // force C locale
     out << "OSL ShadingSystem statistics (" << (void*)this;
     out << ") ver " << OSL_LIBRARY_VERSION_STRING
         << ", LLVM " << OSL_LLVM_FULL_VERSION << "\n";
-    if (m_stat_shaders_requested == 0) {
-        out << "  No shaders requested\n";
+    if (m_stat_shaders_requested == 0 && m_stat_shaders_loaded == 0) {
+        out << "  No shaders requested or loaded\n";
         return out.str();
     }
 
@@ -1589,6 +1678,7 @@ ShadingSystemImpl::getstats (int level) const
     INTOPT (llvm_debug);
     BOOLOPT (llvm_debug_layers);
     BOOLOPT (llvm_debug_ops);
+    BOOLOPT (llvm_output_bitcode);
     BOOLOPT (lazylayers);
     BOOLOPT (lazyglobals);
     BOOLOPT (lazyunconnected);
@@ -1599,6 +1689,7 @@ ShadingSystemImpl::getstats (int level) const
     BOOLOPT (debug_uninit);
     BOOLOPT (lockgeom_default);
     BOOLOPT (strict_messages);
+    BOOLOPT (error_repeats);
     BOOLOPT (range_checking);
     BOOLOPT (greedyjit);
     BOOLOPT (countlayerexecs);
@@ -1621,6 +1712,7 @@ ShadingSystemImpl::getstats (int level) const
     INTOPT (no_noise);
     INTOPT (no_pointcloud);
     INTOPT (force_derivs);
+    INTOPT (allow_shader_replacement);
     INTOPT (exec_repeat);
     STROPT (debug_groupname);
     STROPT (debug_layername);
@@ -1762,8 +1854,8 @@ ShadingSystemImpl::getstats (int level) const
         // Account for times of any groups that haven't yet been destroyed
         {
             spin_lock lock (m_all_shader_groups_mutex);
-            for (size_t i = 0, e = m_all_shader_groups.size(); i < e; ++i) {
-                if (ShaderGroupRef g = m_all_shader_groups[i].lock()) {
+            for (auto&& grp : m_all_shader_groups) {
+                if (ShaderGroupRef g = grp.lock()) {
                     long long ticks = g->m_stat_total_shading_time_ticks;
                     m_group_profile_times[g->name()] += ticks;
                     g->m_stat_total_shading_time_ticks -= ticks;
@@ -1775,7 +1867,7 @@ ShadingSystemImpl::getstats (int level) const
             std::vector<GroupTimeVal> grouptimes;
             for (std::map<ustring,long long>::const_iterator m = m_group_profile_times.begin();
                  m != m_group_profile_times.end(); ++m) {
-                grouptimes.push_back (GroupTimeVal(m->first, m->second));
+                grouptimes.emplace_back(m->first, m->second);
             }
             std::sort (grouptimes.begin(), grouptimes.end(), group_time_compare());
             if (grouptimes.size() > 5)
@@ -1926,6 +2018,14 @@ ShadingSystemImpl::Shader (string_view shaderusage,
         return false;
     }
 
+    // If a layer name was not supplied, make one up.
+    std::string local_layername;
+    if (layername.empty()) {
+        local_layername = OIIO::Strutil::format ("%s_%d", master->shadername(),
+                                                 m_curgroup->nlayers());
+        layername = string_view (local_layername);
+    }
+
     ShaderInstanceRef instance (new ShaderInstance (master, layername));
     instance->parameters (m_pending_params);
     m_pending_params.clear ();
@@ -2030,6 +2130,16 @@ ShadingSystemImpl::ConnectShaders (string_view srclayer, string_view srcparam,
         else
             warning ("ConnectShaders: cannot connect a %s (%s) to a %s (%s)",
                      srccon.type.c_str(), srcparam, dstcon.type.c_str(), dstparam);
+        return false;
+    }
+
+    const Symbol *dstsym = dstinst->mastersymbol(dstcon.param);
+    ASSERT (dstsym);
+    if (dstsym && !dstsym->allowconnect()) {
+        std::string name = dstlayer.size() ? Strutil::format("%s.%s", dstlayer, dstparam)
+                                           : std::string(dstparam);
+        error ("ConnectShaders: cannot connect to %s because it has metadata allowconnect=0",
+               name);
         return false;
     }
 
@@ -2213,7 +2323,7 @@ ShadingSystemImpl::ShaderGroupBegin (string_view groupname,
                     if (s.size() == 0)
                         break;
                 }
-                stringvals.push_back (ustring(s));
+                stringvals.emplace_back(s);
             }
             if (type.is_unsized_array()) {
                 // For unsized arrays, now set the size based on how many
@@ -2456,10 +2566,9 @@ ShadingSystemImpl::decode_connected_param (string_view connectionname,
 
     // Look for a bracket in the "parameter name"
     size_t bracketpos = connectionname.find ('[');
-    const char *bracket = bracketpos == string_view::npos ? NULL
-                                   : connectionname.data()+bracketpos;
     // Grab just the part of the param name up to the bracket
     ustring param (connectionname, 0, bracketpos);
+    string_view cname_remaining = connectionname.substr (bracketpos);
 
     // Search for the param with that name, fail if not found
     c.param = inst->findsymbol (param);
@@ -2488,24 +2597,40 @@ ShadingSystemImpl::decode_connected_param (string_view connectionname,
 
     c.type = sym->typespec();
 
-    if (bracket && c.type.is_array()) {
+    if (! cname_remaining.empty() && c.type.is_array()) {
         // There was at least one set of brackets that appears to be
         // selecting an array element.
-        c.arrayindex = atoi (bracket+1);
+        int index = 0;
+        if (! (Strutil::parse_char (cname_remaining, '[') &&
+               Strutil::parse_int  (cname_remaining, index) &&
+               Strutil::parse_char (cname_remaining, ']'))) {
+            error ("ConnectShaders: malformed parameter \"%s\"", connectionname);
+            c.param = -1;  // mark as invalid
+            return c;
+        }
+        c.arrayindex = index;
         if (c.arrayindex >= c.type.arraylength()) {
             error ("ConnectShaders: cannot request array element %s from a %s",
                    connectionname, c.type.c_str());
             c.arrayindex = c.type.arraylength() - 1;  // clamp it
         }
         c.type.make_array (0);              // chop to the element type
-        bracket = strchr (bracket+1, '[');  // skip to next bracket
+        Strutil::skip_whitespace (cname_remaining); // skip to next bracket
     }
 
-    if (bracket && ! c.type.is_closure() &&
-            c.type.aggregate() != TypeDesc::SCALAR) {
+    if (! cname_remaining.empty() && cname_remaining.front() == '[' &&
+          ! c.type.is_closure() && c.type.aggregate() != TypeDesc::SCALAR) {
         // There was at least one set of brackets that appears to be
         // selecting a color/vector component.
-        c.channel = atoi (bracket+1);
+        int index = 0;
+        if (! (Strutil::parse_char (cname_remaining, '[') &&
+               Strutil::parse_int  (cname_remaining, index) &&
+               Strutil::parse_char (cname_remaining, ']'))) {
+            error ("ConnectShaders: malformed parameter \"%s\"", connectionname);
+            c.param = -1;  // mark as invalid
+            return c;
+        }
+        c.channel = index;
         if (c.channel >= (int)c.type.aggregate()) {
             error ("ConnectShaders: cannot request component %s from a %s",
                    connectionname, c.type.c_str());
@@ -2513,11 +2638,11 @@ ShadingSystemImpl::decode_connected_param (string_view connectionname,
         }
         // chop to just the scalar part
         c.type = TypeSpec ((TypeDesc::BASETYPE)c.type.simpletype().basetype);
-        bracket = strchr (bracket+1, '[');     // skip to next bracket
+        Strutil::skip_whitespace (cname_remaining);
     }
 
-    // Deal with left over brackets
-    if (bracket) {
+    // Deal with left over nonsense or unsupported param designations
+    if (! cname_remaining.empty()) {
         // Still a leftover bracket, no idea what to do about that
         error ("ConnectShaders: don't know how to connect '%s' when \"%s\" is a \"%s\"",
                connectionname, param.c_str(), c.type.c_str());
@@ -2545,19 +2670,23 @@ ShadingSystemImpl::is_renderer_output (ustring layername, ustring paramname,
 {
     if (group) {
         const std::vector<ustring> &aovs (group->m_renderer_outputs);
-        if (std::find (aovs.begin(), aovs.end(), paramname) != aovs.end())
-            return true;
-        // Try "layer.name"
-        ustring name2 = ustring::format ("%s.%s", layername, paramname);
-        if (std::find (aovs.begin(), aovs.end(), name2) != aovs.end())
-            return true;
+        if (aovs.size() > 0) {
+            if (std::find(aovs.begin(), aovs.end(), paramname) != aovs.end())
+                return true;
+            // Try "layer.name"
+            ustring name2 = ustring::format("%s.%s", layername, paramname);
+            if (std::find(aovs.begin(), aovs.end(), name2) != aovs.end())
+                return true;
+        }
     }
     const std::vector<ustring> &aovs (m_renderer_outputs);
-    if (std::find (aovs.begin(), aovs.end(), paramname) != aovs.end())
-        return true;
-    ustring name2 = ustring::format ("%s.%s", layername, paramname);
-    if (std::find (aovs.begin(), aovs.end(), name2) != aovs.end())
-        return true;
+    if (aovs.size() > 0) {
+        if (std::find(aovs.begin(), aovs.end(), paramname) != aovs.end())
+            return true;
+        ustring name2 = ustring::format("%s.%s", layername, paramname);
+        if (std::find(aovs.begin(), aovs.end(), name2) != aovs.end())
+            return true;
+    }
     return false;
 }
 
@@ -2600,8 +2729,7 @@ ShadingSystemImpl::group_post_jit_cleanup (ShaderGroup &group)
 
 
 void
-ShadingSystemImpl::optimize_group (ShaderGroup &group,
-                                   int raytypes_on, int raytypes_off)
+ShadingSystemImpl::optimize_group (ShaderGroup &group)
 {
     if (group.optimized())
         return;    // already optimized
@@ -2637,7 +2765,6 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
 
     ShadingContext *ctx = get_context ();
     RuntimeOptimizer rop (*this, group, ctx);
-    rop.set_raytypes (raytypes_on, raytypes_off);
     rop.run ();
 
     // Copy some info recorted by the RuntimeOptimizer into the group
@@ -2654,10 +2781,14 @@ ShadingSystemImpl::optimize_group (ShaderGroup &group,
     group.m_userdata_types.reserve (num_userdata);
     group.m_userdata_offsets.resize (num_userdata, 0);
     group.m_userdata_derivs.reserve (num_userdata);
+    group.m_userdata_layers.reserve (num_userdata);
+    group.m_userdata_init_vals.reserve (num_userdata);
     for (auto&& n : rop.m_userdata_needed) {
         group.m_userdata_names.push_back (n.name);
         group.m_userdata_types.push_back (n.type);
         group.m_userdata_derivs.push_back (n.derivs);
+        group.m_userdata_layers.push_back (n.layer_num);
+        group.m_userdata_init_vals.push_back (n.data);
     }
     group.m_unknown_attributes_needed = rop.m_unknown_attributes_needed;
     for (auto&& f : rop.m_attributes_needed) {
@@ -2961,8 +3092,7 @@ void
 ClosureRegistry::register_closure (string_view name, int id,
                                    const ClosureParam *params,
                                    PrepareClosureFunc prepare,
-                                   SetupClosureFunc setup,
-                                   int alignment)
+                                   SetupClosureFunc setup)
 {
     if (m_closure_table.size() <= (size_t)id)
         m_closure_table.resize(id + 1);
@@ -2977,16 +3107,22 @@ ClosureRegistry::register_closure (string_view name, int id,
         entry.params.push_back(params[i]);
         if (params[i].type == TypeDesc()) {
             entry.struct_size = params[i].offset;
+            /* CLOSURE_FINISH_PARAM stashes the real struct alignement here
+             * make sure that the closure struct doesn't want more alignment than ClosureComponent
+             * because we will be allocating the real struct inside it. */
+            ASSERT_MSG(params[i].field_size <= int(alignof(ClosureComponent)),
+                "Closure %s wants alignment of %d which is larger than that of ClosureComponent",
+                name.c_str(),
+                params[i].field_size);
             break;
         }
-        if (params[i].key == NULL)
+        if (params[i].key == nullptr)
             entry.nformal ++;
         else
             entry.nkeyword ++;
     }
     entry.prepare = prepare;
     entry.setup = setup;
-    entry.alignment = alignment;
     m_closure_name_to_id[ustring(name)] = id;
 }
 
@@ -3049,6 +3185,19 @@ OSL::OSLQuery::init (const ShaderGroup *group, int layernum)
             p.fdefault.clear();
             p.sdefault.clear();
             p.spacename.clear();
+            int n = int (p.type.numelements() * p.type.aggregate);
+            if (p.type.basetype == TypeDesc::INT) {
+                for (int i = 0; i < n; ++i)
+                    p.idefault.push_back (sym->get_int(i));
+            }
+            if (p.type.basetype == TypeDesc::FLOAT) {
+                for (int i = 0; i < n; ++i)
+                    p.fdefault.push_back (sym->get_float(i));
+            }
+            if (p.type.basetype == TypeDesc::STRING) {
+                for (int i = 0; i < n; ++i)
+                    p.sdefault.push_back (sym->get_string(i));
+            }
             p.fields.clear();  // don't bother filling this out
             if (StructSpec *ss = ts.structspec()) {
                 p.structname = ss->name().string();
@@ -3156,7 +3305,7 @@ osl_uninit_check (long long typedesc_, void *vals_,
 
 
 OSL_SHADEOP int
-osl_range_check (int indexvalue, int length, const char *symname,
+osl_range_check_err (int indexvalue, int length, const char *symname,
                  void *sg, const void *sourcefile, int sourceline,
                  const char *groupname, int layer, const char *layername,
                  const char *shadername)

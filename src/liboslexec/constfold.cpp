@@ -303,6 +303,35 @@ DECLFOLDER(constfold_div)
 
 
 
+DECLFOLDER(constfold_mod)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    Symbol &A (*rop.inst()->argsymbol(op.firstarg()+1));
+    Symbol &B (*rop.inst()->argsymbol(op.firstarg()+2));
+
+    if (rop.is_zero(A)) {
+        // R = 0 % B  =>   R = 0
+        rop.turn_into_assign_zero (op, "0 % A => 0");
+        return 1;
+    }
+    if (rop.is_zero(B)) {
+        // R = A % 0   =>   R = 0
+        rop.turn_into_assign_zero (op, "A % 0 => 0");
+        return 1;
+    }
+    if (A.is_constant() && B.is_constant() &&
+        A.typespec().is_int() && B.typespec().is_int()) {
+        int a = A.get_int();
+        int b = B.get_int();
+        int cind = rop.add_constant (b ? (a % b) : 0);
+        rop.turn_into_assign (op, cind, "const % const");
+        return 1;
+    }
+    return 0;
+}
+
+
+
 DECLFOLDER(constfold_dot)
 {
     Opcode &op (rop.inst()->ops()[opnum]);
@@ -1131,13 +1160,27 @@ DECLFOLDER(constfold_hash)
 {
     // Try to turn R=hash(s) into R=C
     Opcode &op (rop.inst()->ops()[opnum]);
-    Symbol &S (*rop.inst()->argsymbol(op.firstarg()+1));
-    if (S.is_constant()) {
-        ASSERT (S.typespec().is_string());
-        int result = (int) (*(ustring *)S.data()).hash();
-        int cind = rop.add_constant (result);
-        rop.turn_into_assign (op, cind, "const fold hash");
-        return 1;
+    Symbol *S (rop.inst()->argsymbol(op.firstarg()+1));
+    Symbol *T (op.nargs() > 2 ? rop.inst()->argsymbol(op.firstarg()+2) : NULL);
+    if (S->is_constant() && (T == NULL || T->is_constant())) {
+        int cind = -1;
+        if (S->typespec().is_string()) {
+            cind = rop.add_constant ((int) (*(ustring *)S->data()).hash());
+        } else if (op.nargs() == 2 && S->typespec().is_int()) {
+            cind = rop.add_constant (inthashi (S->get_int()));
+        } else if (op.nargs() == 2 && S->typespec().is_float()) {
+            cind = rop.add_constant (inthashf (S->get_float()));
+        } else if (op.nargs() == 3 && S->typespec().is_float() && T->typespec().is_float()) {
+            cind = rop.add_constant (inthashf (S->get_float(), T->get_float()));
+        } else if (op.nargs() == 2 && S->typespec().is_triple()) {
+            cind = rop.add_constant (inthashf ((const float *)S->data()));
+        } else if (op.nargs() == 3 && S->typespec().is_triple() && T->typespec().is_float()) {
+            cind = rop.add_constant (inthashf ((const float *)S->data(), T->get_float()));
+        }
+        if (cind >= 0) {
+            rop.turn_into_assign (op, cind, "const fold hash");
+            return 1;
+        }
     }
     return 0;
 }
@@ -1196,7 +1239,7 @@ DECLFOLDER(constfold_stoi)
     if (S.is_constant()) {
         ASSERT (S.typespec().is_string());
         ustring s = *(ustring *)S.data();
-        int cind = rop.add_constant ((int) strtol(s.c_str(), NULL, 10));
+        int cind = rop.add_constant (Strutil::from_string<int>(s));
         rop.turn_into_assign (op, cind, "const fold stoi");
         return 1;
     }
@@ -1213,7 +1256,7 @@ DECLFOLDER(constfold_stof)
     if (S.is_constant()) {
         ASSERT (S.typespec().is_string());
         ustring s = *(ustring *)S.data();
-        int cind = rop.add_constant ((float) strtod(s.c_str(), NULL));
+        int cind = rop.add_constant (Strutil::from_string<float>(s));
         rop.turn_into_assign (op, cind, "const fold stof");
         return 1;
     }
@@ -2154,6 +2197,39 @@ DECLFOLDER(constfold_transform)
 
 
 
+DECLFOLDER(constfold_transformc)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    // Symbol &Result = *rop.opargsym (op, 0);
+    Symbol &From = *rop.opargsym (op, 1);
+    Symbol &To = *rop.opargsym (op, 2);
+    Symbol &C = *rop.opargsym (op, 3);
+
+    if (From.is_constant() && To.is_constant()) {
+        ustring from = From.get_string();
+        ustring to = To.get_string();
+        if (from == Strings::RGB)
+            from = Strings::rgb;
+        if (to == Strings::RGB)
+            to = Strings::rgb;
+        if (from == to) {
+            rop.turn_into_assign (op, rop.inst()->arg(op.firstarg()+3),
+                                  "transformc by identity");
+            return 1;
+        }
+        if (C.is_constant()) {
+            Color3 Cin (C.get_float(0), C.get_float(1), C.get_float(2));
+            Color3 result = rop.shadingcontext()->transformc (from, to, Cin);
+            rop.turn_into_assign (op, rop.add_constant(result),
+                                  "transformc => constant");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+
 DECLFOLDER(constfold_setmessage)
 {
     Opcode &op (rop.inst()->ops()[opnum]);
@@ -2243,7 +2319,11 @@ DECLFOLDER(constfold_getattribute)
     bool found = false;
 
     // Check global things first
-    if (attr_name == "shader:shadername" && attr_type == TypeDesc::TypeString) {
+    if (attr_name == "osl:version" && attr_type == TypeDesc::TypeInt) {
+        int *val = (int *)(char *)buf;
+        *val = OSL_VERSION;
+        found = true;
+    } else if (attr_name == "shader:shadername" && attr_type == TypeDesc::TypeString) {
         ustring *up = (ustring *)(char *)buf;
         *up = ustring(rop.inst()->shadername());
         found = true;
@@ -2590,10 +2670,6 @@ DECLFOLDER(constfold_pointcloud_search)
             continue;
         void *const_data = NULL;
         TypeDesc const_valtype = value_types[i];
-        // How big should the constant arrays be?  Shrink to the size of
-        // the results if they are much smaller.
-        if (count < const_valtype.arraylen/2 && const_valtype.arraylen > 8)
-            const_valtype.arraylen = count;
         tmp.clear ();
         tmp.resize (const_valtype.size(), 0);
         const_data = &tmp[0];
@@ -2684,7 +2760,7 @@ DECLFOLDER(constfold_pointcloud_get)
     int ok = rop.renderer()->pointcloud_get (rop.shaderglobals(), filename,
                                              indices, count,
                                              *(ustring *)Attr_name.data(),
-                                             valtype.elementtype(), &data[0]);
+                                             valtype, &data[0]);
     rop.shadingsys().pointcloud_stats (0, 1, 0);
 
     rop.turn_into_assign (op, rop.add_constant (TypeDesc::TypeInt, &ok),

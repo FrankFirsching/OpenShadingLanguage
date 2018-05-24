@@ -24,8 +24,8 @@ brew install flex bison
 brew install ilmbase openexr
 #brew install boost-python
 brew install opencolorio partio
-#brew install freetype libpng
-brew install llvm
+brew install freetype libpng
+brew install llvm${LLVMBREWVER}
 #brew install homebrew/science/hdf5 --with-threadsafe
 #brew install field3d webp ffmpeg openjpeg opencv
 echo ""

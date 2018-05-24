@@ -8,15 +8,19 @@ set (USE_CPP 11 CACHE STRING "C++ standard to prefer (11, 14, etc.)")
 option (USE_LIBCPLUSPLUS "Compile with clang libc++")
 set (USE_SIMD "" CACHE STRING "Use SIMD directives (0, sse2, sse3, ssse3, sse4.1, sse4.2, avx, avx2, avx512f, f16c)")
 option (STOP_ON_WARNING "Stop building if there are any compiler warnings" ON)
-option (HIDE_SYMBOLS "Hide symbols not in the public API")
+option (HIDE_SYMBOLS "Hide symbols not in the public API" ON)
 option (USE_CCACHE "Use ccache if found" ON)
 option (USE_fPIC "Build with -fPIC")
 set (EXTRA_CPP_ARGS "" CACHE STRING "Extra C++ command line definitions")
 set (EXTRA_DSO_LINK_ARGS "" CACHE STRING "Extra command line definitions when building DSOs")
-option (BUILDSTATIC "Build static libraries instead of shared")
-option (LINKSTATIC  "Link with static external libraries when possible")
-option (CODECOV "Build code coverage tests")
+option (BUILDSTATIC "Build static libraries instead of shared" OFF)
+option (LINKSTATIC  "Link with static external libraries when possible" OFF)
+option (CODECOV "Build code coverage tests" OFF)
 set (SANITIZE "" CACHE STRING "Build code using sanitizer (address, thread)")
+option (CLANG_TIDY "Enable clang-tidy" OFF)
+set (CLANG_TIDY_CHECKS "-*" CACHE STRING "clang-tidy checks to perform")
+set (CLANG_TIDY_ARGS "" CACHE STRING "clang-tidy args")
+option (CLANG_TIDY_FIX "Have clang-tidy fix source" OFF)
 
 
 # Figure out which compiler we're using
@@ -60,8 +64,11 @@ endif ()
 # turn on more detailed warnings and consider warnings as errors
 if (NOT MSVC)
     add_definitions ("-Wall")
-    if (STOP_ON_WARNING)
+    if (STOP_ON_WARNING OR DEFINED ENV{CI})
         add_definitions ("-Werror")
+        # N.B. Force CI builds (Travis defines $CI) to use -Werror, even if
+        # STOP_ON_WARNING has been switched off by default, which we may do
+        # in release branches.
     endif ()
 endif ()
 
@@ -155,7 +162,6 @@ if (MSVC)
     add_definitions (-D_CRT_NONSTDC_NO_WARNINGS)
     add_definitions (-D_SCL_SECURE_NO_WARNINGS)
     add_definitions (-DJAS_WIN_MSVC_BUILD)
-    add_definitions (-DOPENEXR_DLL)
 endif (MSVC)
 
 # Use ccache if found
@@ -169,6 +175,7 @@ if (CCACHE_FOUND AND USE_CCACHE)
     endif ()
 endif ()
 
+set (CSTD_FLAGS "")
 if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_INTEL)
     if (USE_CPP VERSION_GREATER 11)
         message (STATUS "Building for C++14")
@@ -232,10 +239,13 @@ endif ()
 include (CMakePushCheckState)
 include (CheckCXXSourceRuns)
 
+cmake_push_check_state ()
+set (CMAKE_REQUIRED_DEFINITIONS ${CSTD_FLAGS})
 check_cxx_source_runs("
       #include <regex>
       int main() {
-          return std::regex_match(\"abc\", std::regex(\"(a)(.*)\")) ? 0 : 1;
+          std::string r = std::regex_replace(std::string(\"abc\"), std::regex(\"b\"), \" \");
+          return r == \"a c\" ? 0 : -1;
       }"
       USE_STD_REGEX)
 if (USE_STD_REGEX)
@@ -243,7 +253,7 @@ if (USE_STD_REGEX)
 else ()
     add_definitions (-DUSE_BOOST_REGEX)
 endif ()
-
+cmake_pop_check_state ()
 
 # Code coverage options
 if (CODECOV AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
@@ -280,6 +290,18 @@ if (SANITIZE AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
     add_definitions ("-D${PROJECT_NAME}_SANITIZE=1")
 endif ()
 
+# clang-tidy options
+if (CLANG_TIDY)
+    set (CMAKE_CXX_CLANG_TIDY "clang-tidy;-header-filter=(${PROJECT_NAME})|(${PROJ_NAME})|(${PROJ_NAME_LOWER})|(_pvt.h)")
+    if (CLANG_TIDY_ARGS)
+        set (CMAKE_CXX_CLANG_TIDY "${CMAKE_CXX_CLANG_TIDY};${CLANG_TIDY_ARGS}")
+    endif ()
+    if (CLANG_TIDY_FIX)
+        set (CMAKE_CXX_CLANG_TIDY "${CMAKE_CXX_CLANG_TIDY};-fix")
+    endif ()
+    set (CMAKE_CXX_CLANG_TIDY "${CMAKE_CXX_CLANG_TIDY};-checks=${CLANG_TIDY_CHECKS}")
+    message (STATUS "clang-tidy command line is: ${CMAKE_CXX_CLANG_TIDY}")
+endif ()
 
 if (EXTRA_CPP_ARGS)
     message (STATUS "Extra C++ args: ${EXTRA_CPP_ARGS}")
@@ -290,16 +312,12 @@ endif()
 if (BUILDSTATIC)
     message (STATUS "Building static libraries")
     set (LIBRARY_BUILD_TYPE STATIC)
-    add_definitions ("-DOSL_STATIC_LIBRARY=1")
+    add_definitions(-D${PROJECT_NAME}_STATIC_BUILD=1)
     if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
         # On Linux, the lack of -fPIC when building static libraries seems
         # incompatible with the dynamic library needed for the Python bindings.
         set (USE_PYTHON OFF)
         set (USE_PYTHON3 OFF)
-    endif ()
-    if (WIN32)
-        set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
-        set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
     endif ()
 else ()
     set (LIBRARY_BUILD_TYPE SHARED)
@@ -319,7 +337,7 @@ if (LINKSTATIC)
 else ()
     if (MSVC)
         add_definitions (-DBOOST_ALL_DYN_LINK)
-        # Necessary?  add_definitions (-DOPENEXR_DLL)
+        add_definitions (-DOPENEXR_DLL)
     endif ()
 endif ()
 

@@ -231,7 +231,7 @@ void
 OSOReaderToMaster::add_param_default (const char *def, size_t offset, const Symbol& sym)
 {
   if (sym.typespec().is_unsized_array() && offset >= m_master->m_sdefaults.size())
-      m_master->m_sdefaults.push_back(ustring(def));
+      m_master->m_sdefaults.emplace_back(def);
   else
       m_master->m_sdefaults[offset] = ustring(def);
 }
@@ -450,10 +450,11 @@ OSOReaderToMaster::hint (string_view hintstring)
     }
     if (extract_prefix (h, "%meta{") && m_master->m_symbols.size()) {
         Symbol &sym (m_master->m_symbols.back());
-        int lockval = -1;
-        int ok = sscanf (h.c_str(), " int , lockgeom , %d", &lockval);
-        if (ok)
-            sym.lockgeom (lockval);
+        int ival = -1;
+        if (sscanf (h.c_str(), " int , lockgeom , %d", &ival))
+            sym.lockgeom (ival);
+        else if (sscanf (h.c_str(), " int , allowconnect , %d", &ival))
+            sym.allowconnect (ival);
     }
 }
 
@@ -566,6 +567,8 @@ OSOReaderToMaster::instruction_end ()
 ShaderMaster::ref
 ShadingSystemImpl::loadshader (string_view cname)
 {
+    if (Strutil::ends_with (cname, ".oso"))
+        cname.remove_suffix (4);   // strip superfluous .oso
     if (! cname.size()) {
         error ("Attempt to load shader with empty name \"\".");
         return NULL;
@@ -634,9 +637,9 @@ ShadingSystemImpl::LoadMemoryCompiledShader (string_view shadername,
     ustring name (shadername);
     lock_guard guard (m_mutex);  // Thread safety
     ShaderNameMap::const_iterator found = m_shader_masters.find (name);
-    if (found != m_shader_masters.end()) {
+    if (found != m_shader_masters.end() && ! allow_shader_replacement()) {
         if (debug())
-            info ("Preload shader %s already exists in shader_masters", name.c_str());
+            info ("Preload shader %s already exists in shader_masters", name);
         return false;
     }
 

@@ -15,8 +15,11 @@ if (NOT VERBOSE)
     set (PugiXML_FIND_QUIETLY TRUE)
     set (PythonInterp_FIND_QUIETLY true)
     set (PythonLibs_FIND_QUIETLY true)
+    set (Qt5_FIND_QUIETLY true)
     set (Threads_FIND_QUIETLY true)
     set (ZLIB_FIND_QUIETLY true)
+    set (CUDA_FIND_QUIETLY true)
+    set (OptiX_FIND_QUIETLY true)
 endif ()
 
 
@@ -31,21 +34,18 @@ endif ()
 ###########################################################################
 # IlmBase setup
 
-find_package (OpenEXR REQUIRED)
+find_package (OpenEXR 2.0 REQUIRED)
 #OpenEXR 2.2 still has problems with importing ImathInt64.h unqualified
 #thus need for ilmbase/OpenEXR
 include_directories ("${OPENEXR_INCLUDE_DIR}"
                      "${ILMBASE_INCLUDE_DIR}"
                      "${ILMBASE_INCLUDE_DIR}/OpenEXR")
 if (${OPENEXR_VERSION} VERSION_LESS 2.0.0)
-    # OpenEXR 1.x had weird #include dirctives, this is also necessary:
-    include_directories ("${OPENEXR_INCLUDE_DIR}/OpenEXR")
-else ()
-    add_definitions (-DUSE_OPENEXR_VERSION2=1)
+    message (FATAL_ERROR "OpenEXR/Ilmbase is too old")
 endif ()
 if (NOT OpenEXR_FIND_QUIETLY)
-    message (STATUS "ILMBASE_INCLUDE_DIR = ${ILMBASE_INCLUDE_DIR}")
-    message (STATUS "ILMBASE_LIBRARIES = ${ILMBASE_LIBRARIES}")
+    message (STATUS "OPENEXR_INCLUDE_DIR = ${OPENEXR_INCLUDE_DIR}")
+    message (STATUS "OPENEXR_LIBRARIES = ${OPENEXR_LIBRARIES}")
 endif ()
 
 # end IlmBase setup
@@ -55,7 +55,7 @@ endif ()
 ###########################################################################
 # OpenImageIO
 
-find_package (OpenImageIO 1.7 REQUIRED)
+find_package (OpenImageIO 1.8 REQUIRED)
 include_directories ("${OPENIMAGEIO_INCLUDE_DIR}")
 link_directories ("${OPENIMAGEIO_LIBRARY_DIRS}")
 message (STATUS "Using OpenImageIO ${OPENIMAGEIO_VERSION}")
@@ -67,7 +67,7 @@ message (STATUS "Using OpenImageIO ${OPENIMAGEIO_VERSION}")
 ###########################################################################
 # LLVM library setup
 
-find_package (LLVM 3.4 REQUIRED)
+find_package (LLVM 4.0 REQUIRED)
 
 # ensure include directory is added (in case of non-standard locations
 include_directories (BEFORE SYSTEM "${LLVM_INCLUDES}")
@@ -92,44 +92,37 @@ if (NOT Boost_FIND_QUIETLY)
     message (STATUS "BOOST_ROOT ${BOOST_ROOT}")
 endif ()
 
-if (NOT DEFINED Boost_ADDITIONAL_VERSIONS)
-  set (Boost_ADDITIONAL_VERSIONS "1.63" "1.62" "1.61" "1.60"
-                                 "1.59" "1.58" "1.57" "1.56" "1.55")
-endif ()
 if (LINKSTATIC)
     set (Boost_USE_STATIC_LIBS ON)
 endif ()
 set (Boost_USE_MULTITHREADED ON)
-if (BOOST_CUSTOM)
-    set (Boost_FOUND true)
-    # N.B. For a custom version, the caller had better set up the variables
-    # Boost_VERSION, Boost_INCLUDE_DIRS, Boost_LIBRARY_DIRS, Boost_LIBRARIES.
-else ()
-    set (Boost_COMPONENTS system thread)
-    if (NOT USE_STD_REGEX)
-        list (APPEND Boost_COMPONENTS regex)
-    endif ()
-    if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_APPLECLANG OR
-            ${LLVM_VERSION} VERSION_LESS 3.6)
+set (Boost_COMPONENTS system thread)
+if (NOT USE_STD_REGEX)
+    list (APPEND Boost_COMPONENTS regex)
+endif ()
+if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_APPLECLANG)
+    set (_CLANG_PREPROCESSOR_CAN_WORK ON)
+endif ()
+if (GCC_VERSION)
+    if (${GCC_VERSION} VERSION_LESS 4.9)
         set (_CLANG_PREPROCESSOR_CAN_WORK ON)
     endif ()
-    if (GCC_VERSION)
-        if (${GCC_VERSION} VERSION_LESS 4.9)
-            set (_CLANG_PREPROCESSOR_CAN_WORK ON)
-        endif ()
-    endif ()
-    if (USE_BOOST_WAVE OR (NOT CLANG_LIBRARIES)
-        OR (NOT _CLANG_PREPROCESSOR_CAN_WORK))
-        # N.B. Using clang for preprocessing seems to work when using clang,
-        # or gcc 4.8.x, or LLVM <= 3.5. When those conditions aren't met,
-        # fall back on Boost Wave. We'll lift this restriction as soon as we
-        # fix whatever is broken.
-        list (APPEND Boost_COMPONENTS filesystem wave)
-        add_definitions (-DUSE_BOOST_WAVE=1)
-        message (STATUS "Using Boost Wave for preprocessing")
-    else ()
-        message (STATUS "Using clang internals for preprocessing")
-    endif ()
+endif ()
+if (USE_BOOST_WAVE OR (NOT CLANG_LIBRARIES)
+    OR (NOT _CLANG_PREPROCESSOR_CAN_WORK))
+    # N.B. Using clang for preprocessing seems to work when using clang,
+    # or gcc 4.8.x, or LLVM <= 3.5. When those conditions aren't met,
+    # fall back on Boost Wave. We'll lift this restriction as soon as we
+    # fix whatever is broken.
+    list (APPEND Boost_COMPONENTS filesystem wave)
+    add_definitions (-DUSE_BOOST_WAVE=1)
+    message (STATUS "Using Boost Wave for preprocessing")
+else ()
+    message (STATUS "Using clang internals for preprocessing")
+endif ()
+if (BOOST_CUSTOM)
+    set (Boost_FOUND true)
+else ()
     find_package (Boost 1.55 REQUIRED
                   COMPONENTS ${Boost_COMPONENTS})
 endif ()
@@ -180,15 +173,98 @@ endif (USE_PARTIO)
 
 
 ###########################################################################
-# Pugixml setup.  Normally we just use the version bundled with oiio, but
-# some linux distros are quite particular about having separate packages so we
-# allow this to be overridden to use the distro-provided package if desired.
-if (USE_EXTERNAL_PUGIXML)
-    find_package (PugiXML REQUIRED)
-    # insert include path to pugixml first, to ensure that the external
-    # pugixml is found, and not the one in OIIO's include directory.
-    include_directories (BEFORE "${PUGIXML_INCLUDE_DIR}")
-    add_definitions ("-DUSE_EXTERNAL_PUGIXML")
-endif()
+# Pugixml setup.  Prefer a system install, but note that FindPugiXML.cmake
+# will look in the OIIO distribution if it's not found on the system.
+find_package (PugiXML REQUIRED)
+include_directories (BEFORE "${PUGIXML_INCLUDE_DIR}")
 # end Pugixml setup
 ###########################################################################
+
+
+###########################################################################
+# Qt setup
+
+if (USE_QT)
+    set (qt5_modules Core Gui Widgets)
+    # if (USE_OPENGL)
+    #     list (APPEND qt5_modules OpenGL)
+    # endif ()
+    find_package (Qt5 COMPONENTS ${qt5_modules})
+endif ()
+if (USE_QT AND Qt5_FOUND)
+    if (NOT Qt5_FIND_QUIETLY)
+        message (STATUS "Qt5_FOUND=${Qt5_FOUND}")
+    endif ()
+else ()
+    message (STATUS "No Qt5 -- skipping components that need Qt5.")
+    if (USE_QT AND NOT Qt5_FOUND AND APPLE)
+        message (STATUS "If you think you installed qt5 with Homebrew and it still doesn't work,")
+        message (STATUS "try:   export PATH=/usr/local/opt/qt5/bin:$PATH")
+    endif ()
+endif ()
+
+# end Qt setup
+###########################################################################
+
+###########################################################################
+# CUDA setup
+
+if (USE_CUDA OR USE_OPTIX)
+    if (NOT CUDA_TOOLKIT_ROOT_DIR AND NOT $ENV{CUDA_TOOLKIT_ROOT_DIR} STREQUAL "")
+        set (CUDA_TOOLKIT_ROOT_DIR $ENV{CUDA_TOOLKIT_ROOT_DIR})
+    endif ()
+
+    if (NOT CUDA_FIND_QUIETLY OR NOT OptiX_FIND_QUIETLY)
+        message (STATUS "CUDA_TOOLKIT_ROOT_DIR = ${CUDA_TOOLKIT_ROOT_DIR}")
+    endif ()
+
+    find_package (CUDA 8.0 REQUIRED)
+    set (CUDA_INCLUDE_DIR ${CUDA_TOOLKIT_ROOT_DIR}/include)
+    include_directories (BEFORE "${CUDA_INCLUDE_DIR}")
+
+    message (STATUS "CUDA version = ${CUDA_VERSION}")
+
+    if (NOT CUDA_FIND_QUIETLY OR NOT OptiX_FIND_QUIETLY)
+        message (STATUS "CUDA includes  = ${CUDA_INCLUDE_DIR}")
+        message (STATUS "CUDA libraries = ${CUDA_LIBRARIES}")
+    endif ()
+
+    STRING (FIND ${LLVM_TARGETS} "NVPTX" nvptx_index)
+    if (NOT ${nvptx_index} GREATER -1)
+        message (FATAL_ERROR "NVTPX target is not available in the provided LLVM build")
+    endif()
+
+    if (${CUDA_VERSION_MAJOR} GREATER 8 AND ${LLVM_VERSION} LESS 6)
+        message (FATAL_ERROR "CUDA ${CUDA_VERSION} requires LLVM 6.0 or greater")
+    endif ()
+
+    # TODO: When compiling for CUDA 9.0+ using clang, specifying the CUDA
+    #       path can result in multiply-defined symbol errors; for CUDA 8.0,
+    #       not defining it results in undefined symbols. It would be better
+    #       if there were a more robust and unified way to handle this, but
+    #       this will have to do for now.
+    if (${CUDA_VERSION_MAJOR} GREATER 8)
+        set (CUDA_LIB_FLAGS "")
+    else ()
+        set (CUDA_LIB_FLAGS "--cuda-path=${CUDA_TOOLKIT_ROOT_DIR}")
+    endif ()
+endif ()
+
+# end CUDA setup
+###########################################################################
+
+###########################################################################
+# OptiX setup
+
+if (USE_OPTIX)
+    find_package (OptiX REQUIRED)
+    include_directories (BEFORE "${OPTIX_INCLUDE_DIR}")
+
+    if (NOT USE_LLVM_BITCODE OR NOT USE_FAST_MATH)
+        message (FATAL_ERROR "Enabling OptiX requires USE_LLVM_BITCODE=1 and USE_FAST_MATH=1")
+    endif ()
+endif ()
+
+# end OptiX setup
+###########################################################################
+

@@ -2,32 +2,29 @@
 
 language: cpp
 sudo: false
-#compiler:
-#    - clang
-#    - gcc
-#os:
-#    - linux
-#    - osx
 osx_image: xcode7.3
-dist: precise
+dist: trusty
 
 
 # Add-ons: specify apt packages for Linux
-addons:
-  apt:
-   sources:
-      - boost-latest
-      - ubuntu-toolchain-r-test
-      - george-edison55-precise-backports
-   packages:
-      - cmake
-      - cmake-data
-      - gcc-4.8
-      - g++-4.8
-      - libboost1.55-all-dev
-      - libtiff4-dev
-      #- llvm-3.9-dev
-      #- clang-3.9
+# Currently, we do this per-matrix-entry so it can be finely customized
+# so that each entry only get the packages it needs.
+#addons:
+#  apt:
+#   sources:
+#      - boost-latest
+#      - ubuntu-toolchain-r-test
+#      - george-edison55-precise-backports
+#   packages:
+#      - g++-4.8
+#      - g++-6
+#      - g++-7
+#      - libboost-filesystem1.55
+#      - libboost-python1.55
+#      - libboost-regex1.55
+#      - libboost-system1.55
+#      - libboost-thread1.55
+#      - libboost-wave1.55
 
 cache:
     ccache: true
@@ -52,25 +49,37 @@ install:
     - if [ "$CXX" == "g++" ]; then export CXX="g++-${WHICHGCC}" ; fi
     - export USE_CCACHE=1
     - export CCACHE_CPP2=1
+    # Temporary fix: Use LG's private openexr branch, until the
+    # fixes are merged into the OpenEXR project that will address
+    # the warnings for gcc7 and C++17 compatibility.
+    -   export EXRREPO=https://github.com/lgritz/openexr.git ;
+    -   export EXRBRANCH=lg-cpp11 ;
     - if [ $TRAVIS_OS_NAME == osx ] ; then
           src/build-scripts/install_homebrew_deps.bash ;
       elif [ $TRAVIS_OS_NAME == linux ] ; then
           CXX="ccache $CXX" CCACHE_CPP2=1 src/build-scripts/build_openexr.bash ;
           export ILMBASE_HOME=$PWD/openexr-install ;
           export OPENEXR_HOME=$PWD/openexr-install ;
-          if [ "$LLVM_VERSION" == "" ]; then export LLVM_VERSION="3.9.0" ; fi ;
-          wget http://releases.llvm.org/${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-14.04.tar.xz ;
-          tar xf clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-14.04.tar.xz ;
-          rm -f clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-14.04.tar.xz ;
+          if [ "$LLVM_VERSION" == "" ]; then export LLVM_VERSION="error" ; fi ;
+          if [ "$LLVM_VERSION" == "5.0.0" ]; then export LLVMTAR=clang+llvm-${LLVM_VERSION}-linux-x86_64-ubuntu14.04.tar.xz ; else export LLVMTAR=clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-14.04.tar.xz ; fi;
+          echo LLVMTAR = $LLVMTAR ;
+          wget http://releases.llvm.org/${LLVM_VERSION}/${LLVMTAR} ;
+          tar xf $LLVMTAR ;
+          rm -f $LLVMTAR ;
+          echo "Installed ${LLVM_VERSION}" ;
           mv clang+llvm* llvm-install ;
           export LLVM_DIRECTORY=$PWD/llvm-install ;
+          ls -a $LLVM_DIRECTORY ;
       fi
     - export OIIOMAKEFLAGS="$OIIOMAKEFLAGS -j2 DEBUG= USE_PYTHON=0 OIIO_BUILD_TESTS=0"
+    - export OPENIMAGEIO_SITE=travis
+    - export OSL_SITE=travis
     - src/build-scripts/build_openimageio.bash
     - export OPENIMAGEIOHOME=$PWD/OpenImageIO/dist/$OIIOPLATFORM
+    - export PATH=$OPENIMAGEIOHOME/bin:$PATH
     - export DYLD_LIBRARY_PATH=$OPENIMAGEIOHOME/lib:$DYLD_LIBRARY_PATH
     - export LD_LIBRARY_PATH=$OPENIMAGEIOHOME/lib:$LD_LIBRARY_PATH
-    - export PATH=$OPENIMAGEIOHOME/bin:$PATH
+    - export PYTHONPATH=$OPENIMAGEIOHOME/python:$PYTHONPATH
     - if [ $TRAVIS_OS_NAME == linux ] ; then
           export BUILD_FLAGS="$BUILD_FLAGS LLVM_STATIC=1" ;
           export TEST_FLAGS="-E broken\|render-cornell\|render-oren-nayar\|render-veachmis\|render-ward" ;
@@ -82,11 +91,9 @@ install:
 script:
     - make VERBOSE=1 $BUILD_FLAGS cmakesetup
     - make -j2 $BUILD_FLAGS
-    - export OSLHOME=$PWD/dist/$PLATFORM
-    - export DYLD_LIBRARY_PATH=$OSLHOME/lib:$DYLD_LIBRARY_PATH 
-    - export LD_LIBRARY_PATH=$OSLHOME/lib:$LD_LIBRARY_PATH
-    - export PYTHONPATH=$OSLHOME/python:$OPENIMAGEIOHOME/python:$PYTHONPATH
     - export LSAN_OPTIONS=suppressions=$PWD/src/build-scripts/nosanitize.txt
+    - export OSLHOME=$PWD/dist/$PLATFORM
+    - export OIIO_LIBRARY_PATH=$OSLHOME/lib:${OIIO_LIBRARY_PATH}
     - make $BUILD_FLAGS test
 
 
@@ -105,72 +112,113 @@ branches:
 matrix:
     fast_finish: true
     include:
-      # Build with C++11, optimized build, against OIIO master
+      # Build with C++11, default compiler, optimized build, against OIIO
+      # master, and LLVM 5.0.
       - os: linux
         compiler: gcc
+        addons:
+          apt:
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-regex1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: WHICHGCC=4.8 LLVM_VERSION=5.0.0
       - os: osx
         compiler: clang
-      # Build with C++11, DEBUG build, against OIIO master
-      - os: linux
-        compiler: gcc
-        env: DEBUG=1
-      # - os: osx
-      #   compiler: clang
-      #   env: DEBUG=1
     # Test against the older release branch of OIIO (all the other tests
-    # are against OIIO master).
-      - os: linux
-        compiler: gcc
-        env: OIIOBRANCH=release USE_CPP11=1
-      # - os: osx
-      #   compiler: clang
-      #   env: OIIOBRANCH=release USE_CPP11=1
-    # Make sure the older LLVM still works
-      - os: linux
-        compiler: gcc
-        env: LLVM_VERSION=3.5.2
-    # Linux only: test gcc 4.9
+    # are against OIIO master). Simultaneously, test a higher SIMD level.
       - os: linux
         compiler: gcc
         addons:
           apt:
-            sources: [ 'ubuntu-toolchain-r-test', 'boost-latest', 'george-edison55-precise-backports' ]
-            packages: [ 'g++-4.9', 'cmake', 'cmake-data', 'libboost1.55-all-dev', 'libtiff4-dev' ]
-        env: WHICHGCC=4.9
-    # Linux only: test gcc 5
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-regex1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: OIIOBRANCH=release USE_SIMD=sse4.2 LLVM_VERSION=5.0.0
+    # Test gcc6, and highest SIMD level supported by Travis, and newer LLVM
       - os: linux
         compiler: gcc
         addons:
           apt:
-            sources: [ 'ubuntu-toolchain-r-test', 'boost-latest', 'george-edison55-precise-backports' ]
-            packages: [ 'g++-5', 'cmake', 'cmake-data', 'libboost1.55-all-dev', 'libtiff4-dev' ]
-        env: WHICHGCC=5
-    # Linux only: test gcc 6 (catch new warnings hot off the presses) and
-    # also use a higher SIMD level, avx and f16c, to make sure all is well.
-    # TravisCI's OSX images don't yet support avx/f16c, so we only do this
-    # on Linux for now, but eventually we'll want to separate these concerns
-    # into separate tests.
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - g++-6
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: WHICHGCC=6 USE_SIMD=avx,f16c LLVM_VERSION=5.0.0
+    # Linux only: test gcc 7, also test C++14 and newer LLVM
       - os: linux
         compiler: gcc
         addons:
           apt:
-            sources: [ 'ubuntu-toolchain-r-test', 'boost-latest', 'george-edison55-precise-backports' ]
-            packages: [ 'g++-6', 'cmake', 'cmake-data', 'libboost1.55-all-dev', 'libtiff4-dev' ]
-        env: WHICHGCC=6 USE_SIMD=avx,f16c
-    # Test new gcc against older LLVM
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - g++-7
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: WHICHGCC=7 USE_CPP=14 LLVM_VERSION=5.0.0
+    # Build with C++11, DEBUG build, against OIIO master
       - os: linux
         compiler: gcc
         addons:
           apt:
-            sources: [ 'ubuntu-toolchain-r-test', 'boost-latest', 'george-edison55-precise-backports' ]
-            packages: [ 'g++-6', 'cmake', 'cmake-data', 'libboost1.55-all-dev', 'libtiff4-dev' ]
-        env: WHICHGCC=6 USE_SIMD=avx,f16c LLVM_VERSION=3.5.2
-    # One more, just for the heck of it, turn all SIMD off.  I guess this
-    # should/could be both platforms, but in the interest of making the
-    # tests go faster, don't bother doing it on OSX.
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-regex1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: DEBUG=1 LLVM_VERSION=4.0.0
+    # One more, just for the heck of it, turn all SIMD off, and also test
+    # against the oldest LLVM we still support and the oldest OIIO.
       - os: linux
         compiler: gcc
-        env: USE_SIMD=0
+        addons:
+          apt:
+            sources:
+              - ubuntu-toolchain-r-test
+              - boost-latest
+            packages:
+              - libboost1.55-dev
+              - libboost-filesystem1.55
+              - libboost-python1.55
+              - libboost-regex1.55
+              - libboost-system1.55
+              - libboost-thread1.55
+              - libboost-wave1.55
+        env: USE_SIMD=0 LLVM_VERSION=4.0.0 OIIOBRANCH=RB-1.8
 
 notifications:
     email:

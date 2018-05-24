@@ -32,7 +32,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <memory>
 #include <unordered_map>
 #include <OpenImageIO/ustring.h>
-#include "OSL/oslexec.h"
+#include <OSL/oslexec.h>
 
 OSL_NAMESPACE_ENTER
 
@@ -99,6 +99,8 @@ private:
     AttrGetterMap m_attr_getters;
 
     // Attribute getters
+    bool get_osl_version (ShaderGlobals *sg, bool derivs, ustring object,
+                         TypeDesc type, ustring name, void *val);
     bool get_camera_resolution (ShaderGlobals *sg, bool derivs, ustring object,
                          TypeDesc type, ustring name, void *val);
     bool get_camera_projection (ShaderGlobals *sg, bool derivs, ustring object,

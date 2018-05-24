@@ -108,6 +108,7 @@ public:
     int add_constant (int c) { return add_constant(TypeDesc::TypeInt, &c); }
     int add_constant (ustring s) { return add_constant(TypeDesc::TypeString, &s); }
     int add_constant (const Matrix44 &c) { return add_constant(TypeDesc::TypeMatrix, &c); }
+    int add_constant (const Color3 &c) { return add_constant(TypeDesc::TypeColor, &c); }
 
     /// Create a new temporary variable of the given type, return its index.
     int add_temp (const TypeSpec &type);
@@ -153,16 +154,11 @@ public:
     int turn_into_nop (int begin, int end, string_view why=NULL);
 
     void debug_opt_impl (string_view message) const;
-#if OIIO_VERSION >= 10803
+
     template<typename... Args>
     inline void debug_opt (string_view fmt, const Args&... args) const {
         debug_opt_impl (Strutil::format (fmt, args...));
     }
-#else
-    TINYFORMAT_WRAP_FORMAT (void, debug_opt, const,
-                            std::ostringstream msg;, msg,
-                            debug_opt_impl(msg.str());)
-#endif
 
     void debug_opt_ops (int opbegin, int opend, string_view message) const;
     void debug_turn_into (const Opcode &op, int numops,
@@ -244,7 +240,8 @@ public:
 
     /// Is the op a "simple" assignment (arg 0 completely overwritten,
     /// no side effects or funny business)?
-    bool is_simple_assign (Opcode &op);
+    /// Optional OpDescriptor is passed to save an extra lookup.
+    bool is_simple_assign (Opcode &op, const OpDescriptor *opd=NULL);
 
     /// Called when symbol sym is "simply" assigned at the given op.  An
     /// assignment is considered simple if it completely overwrites the

@@ -52,16 +52,40 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #  error "This version of OSL requires C++11"
 #endif
 
+#ifndef OSL_HOSTDEVICE
+#  ifdef __CUDACC__
+#    define OSL_HOSTDEVICE __host__ __device__
+#  else
+#    define OSL_HOSTDEVICE
+#  endif
+#endif
+
+#ifndef OSL_DEVICE
+#  ifdef __CUDA_ARCH__
+#    define OSL_DEVICE __device__
+#  else
+#    define OSL_DEVICE
+#  endif
+#endif
+
 // Symbol export defines
 #include "export.h"
 
 // All the things we need from Imath
-#include <OpenEXR/ImathVec.h>
+#ifdef __CUDACC__
+// When compiling for CUDA, we need to make sure the modified Imath
+// headers are included before the stock versions.
+#  include <OSL/ImathVec_cuda.h>
+#  include <OSL/ImathMatrix_cuda.h>
+#else
+#  include <OpenEXR/ImathVec.h>
+#  include <OpenEXR/ImathMatrix.h>
+#endif
+
 #include <OpenEXR/ImathColor.h>
-#include <OpenEXR/ImathMatrix.h>
 
 // All the things we need from OpenImageIO
-#include <OpenImageIO/version.h>
+#include <OpenImageIO/oiioversion.h>
 #include <OpenImageIO/errorhandler.h>
 #include <OpenImageIO/texture.h>
 #include <OpenImageIO/typedesc.h>
@@ -69,9 +93,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/platform.h>
 
 // Extensions to Imath
-#include "matrix22.h"
+#include <OSL/matrix22.h>
 
-#include "oslversion.h"
+#include <OSL/oslversion.h>
 
 OSL_NAMESPACE_ENTER
 
@@ -114,7 +138,6 @@ using OIIO::ustring;
 using OIIO::ustringHash;
 using OIIO::string_view;
 
-
 #ifndef __has_attribute
 #  define __has_attribute(x) 0
 #endif
@@ -129,6 +152,14 @@ using OIIO::string_view;
 #  define OSL_DEPRECATED(msg) __declspec(deprecated(msg))
 #else
 #  define OSL_DEPRECATED(msg)
+#endif
+
+/// Work around bug in GCC with mixed __attribute__ and alignas parsing
+/// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=69585
+#ifdef __GNUC__
+#  define OSL_ALIGNAS(size) __attribute__((aligned(size)))
+#else
+#  define OSL_ALIGNAS(size) alignas(size)
 #endif
 
 OSL_NAMESPACE_EXIT

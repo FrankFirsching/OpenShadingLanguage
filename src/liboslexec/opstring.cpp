@@ -105,13 +105,13 @@ osl_endswith_iss (const char *s_, const char *substr_)
 OSL_SHADEOP int
 osl_stoi_is (const char *str)
 {
-    return str ? strtol(str, NULL, 10) : 0;
+    return str ? Strutil::from_string<int>(str) : 0;
 }
 
 OSL_SHADEOP float
 osl_stof_fs (const char *str)
 {
-    return str ? (float)strtod(str, NULL) : 0.0f;
+    return str ? Strutil::from_string<float>(str) : 0.0f;
 }
 
 OSL_SHADEOP const char *
@@ -209,6 +209,24 @@ osl_warning (ShaderGlobals *sg, const char* format_str, ...)
         va_end (args);
         sg->context->warning ("%s", s);
     }
+}
+
+
+
+OSL_SHADEOP void
+osl_fprintf (ShaderGlobals *sg, const char *filename,
+             const char* format_str, ...)
+{
+    va_list args;
+    va_start (args, format_str);
+    std::string s = Strutil::vformat (format_str, args);
+    va_end (args);
+
+    static OIIO::mutex fprintf_mutex;
+    OIIO::lock_guard lock (fprintf_mutex);
+    FILE *file = fopen (filename, "a");
+    fputs (s.c_str(), file);
+    fclose (file);
 }
 
 

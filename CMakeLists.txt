@@ -1,8 +1,10 @@
 cmake_minimum_required (VERSION 3.2.2)
 cmake_policy (SET CMP0048 NEW)  # Allow VERSION specifier in project()
 project (OSL
-         VERSION 1.9.0
+         VERSION 1.10.0
          LANGUAGES CXX C)
+set (PROJ_NAME ${PROJECT_NAME})    # short name
+string (TOLOWER ${PROJ_NAME} PROJ_NAME_LOWER)  # short name lower case
 set (PROJECT_VERSION_RELEASE_TYPE "dev")   # "dev", "betaX", "RCY", ""
 set (${PROJECT_NAME}_VERSION_RELEASE_TYPE ${PROJECT_VERSION_RELEASE_TYPE})
 set (PROJECT_COPYRIGHTYEARS "2008-2017")
@@ -16,7 +18,6 @@ message (STATUS "CMake version is ${CMAKE_VERSION}")
 cmake_policy (SET CMP0017 NEW)  # Prefer files from the CMake module directory when including from there.
 cmake_policy (SET CMP0025 NEW)  # Detect AppleClang for new CMake
 cmake_policy (SET CMP0046 OLD)  # Don't error on non-existent dependency in add_dependencies.
-cmake_policy (SET CMP0042 OLD)  # Don't enable MACOSX_RPATH by default
 set (CMAKE_ALLOW_LOOSE_LOOP_CONSTRUCTS TRUE)
 
 # Deprecated names
@@ -32,7 +33,8 @@ set (OSO_FILE_VERSION_MINOR 0)
 if (VERBOSE)
     message (STATUS "Project source dir = ${PROJECT_SOURCE_DIR}")
 endif ()
-message (STATUS "Project build dir = ${CMAKE_BINARY_DIR}")
+message (STATUS "Project build dir   = ${CMAKE_BINARY_DIR}")
+message (STATUS "Project install dir = ${CMAKE_INSTALL_PREFIX}")
 
 if ("${PROJECT_SOURCE_DIR}" STREQUAL "${CMAKE_BINARY_DIR}")
     message (FATAL_ERROR "Not allowed to run in-source build!")
@@ -51,6 +53,8 @@ if (CMAKE_USE_FOLDERS)
     set_property (GLOBAL PROPERTY USE_FOLDERS ON)
 endif ()
 
+include (GNUInstallDirs)
+
 set (CMAKE_MODULE_PATH
      "${PROJECT_SOURCE_DIR}/src/cmake/modules"
      "${PROJECT_SOURCE_DIR}/src/cmake")
@@ -66,7 +70,6 @@ include (compiler)   # All the C++ and compiler related options live here
 ##   LLVM with RRTI, otherwise OSL classes extending LLVM ones
 ##   will cause linker errors.
 set (ENABLERTTI OFF CACHE BOOL "Build with RTTI. Requires a LLVM build with RTTI enabled.")
-
 if (NOT ENABLERTTI)
     if (MSVC)
         set ( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-" )
@@ -76,7 +79,10 @@ if (NOT ENABLERTTI)
 endif()
 
 
-option (VERBOSE "Print lots of messages while compiling" OF)
+option (VERBOSE "Print lots of messages while compiling" OFF)
+set (${PROJ_NAME}_NAMESPACE ${PROJECT_NAME} CACHE STRING "Customized outer namespace base name (version will be added)")
+set (SOVERSION ${OSL_VERSION_MAJOR}.${OSL_VERSION_MINOR}
+     CACHE STRING "Set the SO version in the SO name of the output library")
 option (OSL_BUILD_TESTS "Build the unit tests, testshade, testrender" ON)
 if (WIN32)
     option (USE_LLVM_BITCODE "Generate embedded LLVM bitcode" OFF)
@@ -85,11 +91,14 @@ else ()
 endif ()
 option (USE_PARTIO "Use Partio if found" ON)
 set (PARTIO_HOME "" CACHE STRING "Search path for Partio components")
-option (USE_EXTERNAL_PUGIXML "Use an externally built shared library version of the pugixml library" OFF)
 set (PUGIXML_HOME "" CACHE STRING "Hint about where to find external PugiXML library")
 option (USE_FAST_MATH "Use fast math approximations (if no, then use system math library)" ON)
 option (OSL_BUILD_PLUGINS "Bool OSL plugins, for example OIIO plugin" ON)
 option (USE_BOOST_WAVE "Use Boost Wave for C preprocessor (alternative is to use clang)" OFF)
+option (USE_QT "Include Qt support" ON)
+option (USE_OPTIX "Include OptiX support" OFF)
+set (OPTIX_EXTRA_LIBS CACHE STRING "Extra lib targets needed for OptiX")
+set (CUDA_TARGET_ARCH "sm_35" CACHE STRING "CUDA GPU architecture (e.g. sm_35)")
 
 
 # set (USE_OIIO_STATIC ON CACHE BOOL "If OIIO is built static")
@@ -110,10 +119,9 @@ endif ()
 
 
 # Set the default namespace
-if (OSL_NAMESPACE)
-    add_definitions ("-DOSL_NAMESPACE=${OSL_NAMESPACE}")
-endif ()
-message(STATUS "Setting Namespace to: ${OSL_NAMESPACE}")
+set (PROJ_NAMESPACE "${${PROJ_NAME}_NAMESPACE}")
+set (PROJ_NAMESPACE_V "${PROJ_NAMESPACE}_v${PROJECT_VERSION_MAJOR}_${PROJECT_VERSION_MINOR}")
+message(STATUS "Setting Namespace to: ${PROJ_NAMESPACE_V}")
 
 include (util_macros)
 include (externalpackages)
@@ -121,8 +129,9 @@ include (flexbison)
 include (install)          # installation options all implemented here
 
 include_directories (
+    BEFORE
     "${CMAKE_SOURCE_DIR}/src/include"
-    "${CMAKE_BINARY_DIR}/include/OSL"
+    "${CMAKE_BINARY_DIR}/include"
   )
 
 
@@ -138,13 +147,13 @@ include (CTest)
 
 
 # Tell CMake to process the sub-directories
+add_subdirectory (src/include)
 add_subdirectory (src/liboslcomp)
 add_subdirectory (src/liboslquery)
 add_subdirectory (src/liboslexec)
 add_subdirectory (src/liboslnoise)
 
 add_subdirectory (src/oslc)
-add_subdirectory (src/shaders)
 add_subdirectory (src/oslinfo)
 
 if (OSL_BUILD_TESTS)
@@ -152,12 +161,24 @@ add_subdirectory (src/testshade)
 add_subdirectory (src/testrender)
 endif ()
 
+if (OSL_BUILD_TESTS AND USE_OPTIX)
+add_subdirectory (src/testoptix)
+endif()
+
 if (OSL_BUILD_PLUGINS)
 add_subdirectory (src/osl.imageio)
 endif ()
 
-add_subdirectory (src/include)
+if (USE_QT AND Qt5_FOUND)
+add_subdirectory (src/osltoy)
+endif ()
+
+add_subdirectory (src/shaders)
+add_subdirectory (src/shaders/MaterialX)
+
+if (INSTALL_DOCS)
 add_subdirectory (src/doc)
+endif ()
 
 
 
@@ -175,7 +196,7 @@ add_custom_command (OUTPUT "${CMAKE_BINARY_DIR}/testsuite/runtest.py"
 add_custom_target ( CopyFiles ALL DEPENDS "${CMAKE_BINARY_DIR}/testsuite/runtest.py" )
 
 macro ( TESTSUITE )
-    parse_arguments (_ats "LABEL" "" ${ARGN})
+    cmake_parse_arguments (_ats "" "LABEL" "" ${ARGN})
     # If there was a FOUNDVAR param specified and that variable name is
     # not defined, mark the test as broken.
     if (_ats_FOUNDVAR AND NOT ${_ats_FOUNDVAR})
@@ -183,7 +204,7 @@ macro ( TESTSUITE )
     endif ()
     # Add the tests if all is well.
     set (ALL_TEST_LIST "")
-    foreach (_testname ${_ats_DEFAULT_ARGS})
+    foreach (_testname ${_ats_UNPARSED_ARGUMENTS})
         set (_testsrcdir "${CMAKE_SOURCE_DIR}/testsuite/${_testname}")
         set (_testdir "${CMAKE_BINARY_DIR}/testsuite/${_testname}")
         if (_ats_LABEL MATCHES "broken")
@@ -223,23 +244,28 @@ endmacro ()
 if (OSL_BUILD_TESTS)
 # List all the individual testsuite tests here, except those that need
 # special installed tests.
-TESTSUITE ( and-or-not-synonyms aastep arithmetic array array-derivs array-range
+TESTSUITE ( aastep allowconnect-err and-or-not-synonyms arithmetic
+            array array-derivs array-range array-aassign
             blackbody blendmath breakcont
             bug-array-heapoffsets
             bug-locallifetime bug-outputinit bug-param-duplicate bug-peep
             cellnoise closure closure-array color comparison
             compile-buffer
-            component-range const-array-params const-array-fill
+            component-range
+            connect-components
+            const-array-params const-array-fill
             debugnan debug-uninit
             derivs derivs-muldiv-clobber
             draw_string
             error-dupes exit exponential
+            fprintf
             function-earlyreturn function-simple function-outputelem
+            function-overloads function-redef
             geomath getattribute-camera getattribute-shader
             getsymbol-nonheap gettextureinfo
             group-outputs groupstring
-            hex hyperb
-            ieee_fp if incdec initops intbits isconnected isconstant
+            hash hashnoise hex hyperb
+            ieee_fp if incdec initlist initops intbits isconnected isconstant
             layers layers-Ciassign layers-entry layers-lazy
             layers-nonlazycopy layers-repeatedoutputs
             linearstep
@@ -250,27 +276,36 @@ TESTSUITE ( and-or-not-synonyms aastep arithmetic array array-derivs array-range
             noise-gabor noise-gabor2d-filter noise-gabor3d-filter
             noise-perlin noise-uperlin noise-simplex noise-usimplex
             pnoise pnoise-cell pnoise-gabor pnoise-perlin pnoise-uperlin
+            operator-overloading
             oslc-comma oslc-D
-            oslc-err-arrayindex oslc-err-closuremul
-            oslc-err-format oslc-err-intoverflow
+            oslc-err-arrayindex oslc-err-closuremul oslc-err-field
+            oslc-err-format oslc-err-funcoverload
+            oslc-err-intoverflow oslc-err-write-nonoutput
             oslc-err-noreturn oslc-err-notfunc
+            oslc-err-initlist-args oslc-err-initlist-return
             oslc-err-outputparamvararray oslc-err-paramdefault
-            oslc-err-struct-array-init oslc-err-struct-dup
+            oslc-err-struct-array-init oslc-err-struct-ctr
+            oslc-err-struct-dup oslc-err-struct-print
             oslc-warn-commainit
             oslc-variadic-macro
+            oslc-version
             oslinfo-arrayparams oslinfo-colorctrfloat
             oslinfo-metadata oslinfo-noparams
             osl-imageio
+            paramval-floatpromotion
+            pragma-nowarn
             printf-whole-array
             raytype raytype-specialized reparam
             render-background render-bumptest
             render-cornell render-furnace-diffuse
             render-microfacet render-oren-nayar render-veachmis render-ward
-            select shortcircuit spline splineinverse spline-derivbug
+            select shortcircuit spline splineinverse
+            spline-boundarybug spline-derivbug
             string
             struct struct-array struct-array-mixture
-            struct-err struct-init-copy struct-layers
-            struct-return struct-with-array
+            struct-err struct-init-copy
+            struct-isomorphic-overload struct-layers
+            struct-operator-overload struct-return struct-with-array
             struct-nested struct-nested-assign struct-nested-deep
             ternary
             testshade-expr
@@ -280,12 +315,14 @@ TESTSUITE ( and-or-not-synonyms aastep arithmetic array array-derivs array-range
             texture-missingcolor texture-simple
             texture-smallderivs texture-swirl texture-udim
             texture-width texture-withderivs texture-wrap
-            trailing-commas transform transformc trig typecast
+            trailing-commas
+            transitive-assign
+            transform transformc trig typecast
             unknown-instruction
             vararray-connect vararray-default
             vararray-deserialize vararray-param
             vecctr vector
-            wavelength_color xml )
+            wavelength_color Werror xml )
 
 # Only run field3d-related tests if the local OIIO was built with f3d support.
 EXECUTE_PROCESS ( COMMAND ${OPENIMAGEIO_BIN}/oiiotool --help
@@ -299,21 +336,29 @@ if (PARTIO_FOUND)
     TESTSUITE ( pointcloud pointcloud-fold )
 endif ()
 
+# Only run the OptiX tests if OptiX and CUDA are found
+if (OPTIX_FOUND AND CUDA_FOUND)
+    TESTSUITE ( testoptix testoptix-noise )
+endif ()
+
+# FIXME: still working on MaterialX testsuite
+# add_subdirectory(testsuite/MaterialX)
+
 endif (OSL_BUILD_TESTS)
 
 
 
 #########################################################################
 # Packaging
-set (CPACK_PACKAGE_VERSION_MAJOR ${OSL_LIBRARY_VERSION_MAJOR})
-set (CPACK_PACKAGE_VERSION_MINOR ${OSL_LIBRARY_VERSION_MINOR})
-set (CPACK_PACKAGE_VERSION_PATCH ${OSL_LIBRARY_VERSION_PATCH})
+set (CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set (CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set (CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 # "Vendor" is only used in copyright notices, so we use the same thing that
 # the rest of the copyright notices say.
-set (CPACK_PACKAGE_VENDOR "Sony Pictures Imageworks")
+set (CPACK_PACKAGE_VENDOR ${PROJECT_AUTHORS})
 set (CPACK_PACKAGE_DESCRIPTION_SUMMARY "OpenShadingLanguage is...")
 set (CPACK_PACKAGE_DESCRIPTION_FILE "${PROJECT_SOURCE_DIR}/src/doc/Description.txt")
-set (CPACK_PACKAGE_FILE_NAME OSL-${OSL_LIBRARY_VERSION_MAJOR}.${OSL_LIBRARY_VERSION_MINOR}.${OSL_LIBRARY_VERSION_PATCH}-${platform})
+set (CPACK_PACKAGE_FILE_NAME ${PROJECT_NAME}-${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}-${platform})
 file (COPY "${PROJECT_SOURCE_DIR}/LICENSE" DESTINATION "${CMAKE_BINARY_DIR}")
 file (RENAME "${CMAKE_BINARY_DIR}/LICENSE" "${CMAKE_BINARY_DIR}/License.txt")
 set (CPACK_RESOURCE_FILE_LICENSE "${CMAKE_BINARY_DIR}/License.txt")
@@ -331,7 +376,7 @@ if (APPLE)
     set (CPACK_GENERATOR "TGZ;STGZ;PackageMaker")
     set (CPACK_SOURCE_GENERATOR "TGZ")
 endif ()
-set (CPACK_SOURCE_PACKAGE_FILE_NAME OSL-${OSL_LIBRARY_VERSION_MAJOR}.${OSL_LIBRARY_VERSION_MINOR}.${OSL_LIBRARY_VERSION_PATCH}-source)
+set (CPACK_SOURCE_PACKAGE_FILE_NAME ${PROJECT_NAME}-${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}-source)
 #set (CPACK_SOURCE_STRIP_FILES ...FIXME...)
 set (CPACK_SOURCE_IGNORE_FILES ".*~")
 include (CPack)

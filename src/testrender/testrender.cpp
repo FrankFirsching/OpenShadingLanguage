@@ -34,18 +34,20 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cmath>
 
 #include <OpenImageIO/imageio.h>
+#include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/argparse.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/timer.h>
 #include <OpenImageIO/thread.h>
 
-#ifdef USE_EXTERNAL_PUGIXML
-# include <pugixml.hpp>
-#else
-# include <OpenImageIO/pugixml.hpp>
+#include <pugixml.hpp>
+
+#ifdef USING_OIIO_PUGI
+namespace pugi = OIIO::pugi;
 #endif
 
-#include "OSL/oslexec.h"
+#include <OSL/oslexec.h>
 #include "simplerend.h"
 #include "raytracer.h"
 #include "background.h"
@@ -54,7 +56,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "util.h"
 
 
-using namespace OIIO;
 using namespace OSL;
 
 namespace { // anonymous namespace
@@ -151,22 +152,14 @@ void getargs(int argc, const char *argv[])
         errhandler.verbosity (ErrorHandler::VERBOSE);
 }
 
-Vec3 strtovec(const char* str) {
+Vec3 strtovec(string_view str) {
     Vec3 v(0, 0, 0);
-    sscanf(str, " %f , %f , %f", &v.x, &v.y, &v.z);
+    OIIO::Strutil::parse_float (str, v[0]);
+    OIIO::Strutil::parse_char (str, ',');
+    OIIO::Strutil::parse_float (str, v[1]);
+    OIIO::Strutil::parse_char (str, ',');
+    OIIO::Strutil::parse_float (str, v[2]);
     return v;
-}
-
-int strtoint(const char* str) {
-    int i = 0;
-    sscanf(str, " %d", &i);
-    return i;
-}
-
-float strtoflt(const char* str) {
-    float f = 0;
-    sscanf(str, " %f", &f);
-    return f;
 }
 
 bool strtobool(const char* str) {
@@ -277,7 +270,7 @@ void parse_scene() {
             if (dir_attr) dir = strtovec(dir_attr.value()); else
             if ( at_attr) dir = strtovec( at_attr.value()) - eye;
             if ( up_attr)  up = strtovec( up_attr.value());
-            if (fov_attr) fov = strtoflt(fov_attr.value());
+            if (fov_attr) fov = OIIO::Strutil::from_string<float>(fov_attr.value());
 
             // create actual camera
             camera = Camera(eye, dir, up, fov, xres, yres);
@@ -287,7 +280,7 @@ void parse_scene() {
             pugi::xml_attribute radius_attr = node.attribute("radius");
             if (center_attr && radius_attr) {
                 Vec3  center = strtovec(center_attr.value());
-                float radius = strtoflt(radius_attr.value());
+                float radius = OIIO::Strutil::from_string<float>(radius_attr.value());
                 if (radius > 0) {
                     pugi::xml_attribute light_attr = node.attribute("is_light");
                     bool is_light = light_attr ? strtobool(light_attr.value()) : false;
@@ -310,7 +303,7 @@ void parse_scene() {
         } else if (strcmp(node.name(), "Background") == 0) {
             pugi::xml_attribute res_attr = node.attribute("resolution");
             if (res_attr)
-                backgroundResolution = strtoint(res_attr.value());
+                backgroundResolution = OIIO::Strutil::from_string<int>(res_attr.value());
             backgroundShaderID = int(shaders.size()) - 1;
         } else if (strcmp(node.name(), "ShaderGroup") == 0) {
             ShaderGroupRef group;
@@ -582,6 +575,7 @@ void scanline_worker(Counter& counter, std::vector<Color3>& pixels) {
 } // anonymous namespace
 
 int main (int argc, const char *argv[]) {
+    using namespace OIIO;
     Timer timer;
 
     // Create a new shading system.  We pass it the RendererServices
@@ -652,7 +646,10 @@ int main (int argc, const char *argv[]) {
 
     double setuptime = timer.lap ();
 
+    // Local memory for the pixels
     std::vector<Color3> pixels(xres * yres, Color3(0,0,0));
+    // Make an ImageBuf that wraps it ('pixels' still owns the memory)
+    ImageBuf pixelbuf (ImageSpec(xres, yres, 3, TypeDesc::FLOAT), pixels.data());
 
     // Create shared counter to iterate over one scanline at a time
     Counter scanline_counter(errhandler, yres, "Rendering");
@@ -661,23 +658,31 @@ int main (int argc, const char *argv[]) {
     for (int i = 0; i < num_threads; i++)
         workers.add_thread(new std::thread (scanline_worker, std::ref(scanline_counter), std::ref(pixels)));
     workers.join_all();
+    double runtime = timer.lap();
 
     // Write image to disk
-    ImageOutput* out = ImageOutput::create(imagefile);
-    ImageSpec spec(xres, yres, 3, TypeDesc::HALF);
-    if (out && out->open(imagefile, spec)) {
-        out->write_image(TypeDesc::TypeFloat, &pixels[0]);
-    } else {
-        errhandler.error("Unable to write output image");
+    if (Strutil::iends_with (imagefile, ".jpg") ||
+        Strutil::iends_with (imagefile, ".jpeg") ||
+        Strutil::iends_with (imagefile, ".gif") ||
+        Strutil::iends_with (imagefile, ".png")) {
+        // JPEG, GIF, and PNG images should be automatically saved as sRGB
+        // because they are almost certainly supposed to be displayed on web
+        // pages.
+        ImageBufAlgo::colorconvert (pixelbuf, pixelbuf,
+                                    "linear", "sRGB", false, "", "");
     }
-    delete out;
+    pixelbuf.set_write_format (TypeDesc::HALF);
+    if (! pixelbuf.write (imagefile))
+        errhandler.error ("Unable to write output image: %s",
+                          pixelbuf.geterror().c_str());
 
     // Print some debugging info
     if (debug1 || runstats || profile) {
-        double runtime = timer.lap();
+        double writetime = timer.lap();
         std::cout << "\n";
         std::cout << "Setup: " << OIIO::Strutil::timeintervalformat (setuptime,2) << "\n";
         std::cout << "Run  : " << OIIO::Strutil::timeintervalformat (runtime,2) << "\n";
+        std::cout << "Write: " << OIIO::Strutil::timeintervalformat (writetime,2) << "\n";
         std::cout << "\n";
         std::cout << shadingsys->getstats (5) << "\n";
         OIIO::TextureSystem *texturesys = shadingsys->texturesys();

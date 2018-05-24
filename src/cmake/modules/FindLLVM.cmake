@@ -8,6 +8,7 @@
 #  LLVM_SYSTEM_LIBRARIES - additional libraries needed by LLVM
 #  LLVM_DIRECTORY   - If not already set, the root of the LLVM install
 #  LLVM_LIB_DIR     - where to find llvm libs
+#  LLVM_TARGETS     - List of available LLVM targets
 #  CLANG_LIBRARIES  - list of libraries for clang components (optional,
 #                        those may not be found)
 #
@@ -48,10 +49,14 @@ execute_process (COMMAND ${LLVM_CONFIG} --libdir
 execute_process (COMMAND ${LLVM_CONFIG} --includedir
        OUTPUT_VARIABLE LLVM_INCLUDES
        OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process (COMMAND ${LLVM_CONFIG} --targets-built
+       OUTPUT_VARIABLE LLVM_TARGETS
+       OUTPUT_STRIP_TRAILING_WHITESPACE)
 if (NOT ${LLVM_VERSION} VERSION_LESS 3.8)
     execute_process (COMMAND ${LLVM_CONFIG} --system-libs
                      OUTPUT_VARIABLE LLVM_SYSTEM_LIBRARIES
                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string (REPLACE " " ";" LLVM_SYSTEM_LIBRARIES "${LLVM_SYSTEM_LIBRARIES}")
 else ()
     # Older LLVM did not have llvm-config --system-libs, but we know that
     # on Linux, we'll need curses.

@@ -123,7 +123,7 @@ RuntimeOptimizer::RuntimeOptimizer (ShadingSystemImpl &shadingsys,
       m_next_newconst(0), m_next_newtemp(0),
       m_stat_opt_locking_time(0), m_stat_specialization_time(0),
       m_stop_optimizing(false),
-      m_raytypes_on(0), m_raytypes_off(0)
+      m_raytypes_on(group.raytypes_on()), m_raytypes_off(group.raytypes_off())
 {
     memset (&m_shaderglobals, 0, sizeof(ShaderGlobals));
     m_shaderglobals.context = shadingcontext();
@@ -219,12 +219,12 @@ RuntimeOptimizer::set_debug ()
 int
 RuntimeOptimizer::find_constant (const TypeSpec &type, const void *data)
 {
-    for (int i = 0;  i < (int)m_all_consts.size();  ++i) {
-        const Symbol &s (*inst()->symbol(m_all_consts[i]));
+    for (int c : m_all_consts) {
+        const Symbol &s (*inst()->symbol(c));
         ASSERT (s.symtype() == SymTypeConst);
         if (equivalent (s.typespec(), type) &&
               !memcmp (s.data(), data, s.typespec().simpletype().size())) {
-            return m_all_consts[i];
+            return c;
         }
     }
     return -1;
@@ -520,8 +520,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
     // the jump addresses of other ops and the param init ranges.
     if (opnum < (int)code.size()-1) {
         // Adjust jump offsets
-        for (size_t n = 0;  n < code.size();  ++n) {
-            Opcode &c (code[n]);
+        for (auto& c : code) {
             for (int j = 0; j < (int)Opcode::max_jumps && c.jump(j) >= 0; ++j) {
                 if (c.jump(j) > opnum) {
                     c.jump(j) = c.jump(j) + 1;
@@ -808,6 +807,7 @@ OSOProcessorBase::const_value_as_string (const Symbol &A)
     TypeDesc type (A.typespec().simpletype());
     int n = type.numelements() * type.aggregate;
     std::ostringstream s;
+    s.imbue (std::locale::classic());  // force C locale
     if (type.basetype == TypeDesc::FLOAT) {
         for (int i = 0; i < n; ++i)
             s << (i ? "," : "") << ((const float *)A.data())[i];
@@ -921,12 +921,19 @@ RuntimeOptimizer::simplify_params ()
             // It's connected to an earlier layer.  If the output var of
             // the upstream shader is effectively constant or a global,
             // then so is this variable.
-            turn_into_nop (s->initbegin(), s->initend(),
-                           "connected value doesn't need init ops");
             for (auto&& c : inst()->connections()) {
-                if (c.dst.param == i) {
+                if (c.dst.param != i)
+                    continue;
+                if (c.dst.is_complete()) {
+                    /// All components are being set through either
+                    /// float->triple or triple->triple
+                    /// Get rid of the un-needed init ops.
+                    turn_into_nop (s->initbegin(), s->initend(),
+                                   "connected value doesn't need init ops");
+                }
+                if (c.is_complete()) {
                     // srcsym is the earlier group's output param, which
-                    // is connected as the input to the param we're
+                    // is fully connected as the input to the param we're
                     // examining.
                     ShaderInstance *uplayer = group()[c.srclayer];
                     Symbol *srcsym = uplayer->symbol(c.src.param);
@@ -938,8 +945,7 @@ RuntimeOptimizer::simplify_params ()
                     // If so, make sure the global is in this instance's
                     // symbol table, and alias the parameter to it.
                     ustringmap_t &g (m_params_holding_globals[c.srclayer]);
-                    ustringmap_t::const_iterator f;
-                    f = g.find (srcsym->name());
+                    auto f = g.find (srcsym->name());
                     if (f != g.end()) {
                         if (debug() > 1)
                             debug_opt ("Remapping %s.%s because it's connected to "
@@ -972,6 +978,20 @@ RuntimeOptimizer::simplify_params ()
                     }
                 }
             }
+            // FIXME / N.B.: We only optimize "fully complete" connections,
+            // not those involving individual components or array elements
+            // of the connected parameters, because we sure don't track the
+            // constness or aliasing of individual components/element, only
+            // whole variables. But there are two cases where the logic
+            // above fails to fully exploit the connection propagating a
+            // constant value. (a) Partial-to-whole connections, for example
+            // connecting one component of an upstream triple output to a
+            // downstream float input, should propagate the constant, but we
+            // currently neglect this case. (b) If *multiple* conections
+            // combine to fully propagate values, for example if someone was
+            // foolish enough to connect R, G, and B components of color
+            // parameters *separately*, we sure don't notice that and treat
+            // it as a full connection of the color.
         }
     }
 }
@@ -1193,12 +1213,13 @@ RuntimeOptimizer::use_stale_sym (int sym)
 
 
 bool
-RuntimeOptimizer::is_simple_assign (Opcode &op)
+RuntimeOptimizer::is_simple_assign (Opcode &op, const OpDescriptor *opd)
 {
     // Simple only if arg0 is the only write, and is write only.
     if (op.argwrite_bits() != 1 || op.argread(0))
         return false;
-    const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
+    if (! opd)
+        opd = shadingsys().op_descriptor (op.opname());
     if (!opd || !opd->simple_assign)
         return false;   // reject all other known non-simple assignments
     // Make sure the result isn't also read
@@ -1508,9 +1529,9 @@ RuntimeOptimizer::block_unalias (int symindex)
         i->second = -1;
     // In addition to the current block_aliases, unalias from any
     // saved alias lists.
-    for (size_t s = 0, send = m_block_aliases_stack.size(); s < send; ++s) {
-        FastIntMap::iterator i = m_block_aliases_stack[s]->find (symindex);
-        if (i != m_block_aliases_stack[s]->end())
+    for (auto& ba : m_block_aliases_stack) {
+        FastIntMap::iterator i = ba->find (symindex);
+        if (i != ba->end())
             i->second = -1;
     }
 }
@@ -2034,17 +2055,16 @@ RuntimeOptimizer::copy_block_aliases (const FastIntMap &old_block_aliases,
     // Find all symbols written anywhere in the instruction range
     new_block_aliases.clear ();
     new_block_aliases.reserve (old_block_aliases.size());
-    for (FastIntMap::const_iterator alias = old_block_aliases.begin();
-         alias != old_block_aliases.end();  ++alias) {
-        if (alias->second < 0)
+    for (auto&& oba : old_block_aliases) {
+        if (oba.second < 0)
             continue;    // erased alias -- don't copy
-        if (! copy_temps && (inst()->symbol(alias->first)->is_temp() ||
-                             inst()->symbol(alias->second)->is_temp()))
+        if (! copy_temps && (inst()->symbol(oba.first)->is_temp() ||
+                             inst()->symbol(oba.second)->is_temp()))
             continue;    // don't copy temp aliases unless told to
-        if (excluded && (excluded->find(alias->first) != excluded->end() ||
-                         excluded->find(alias->second) != excluded->end()))
+        if (excluded && (excluded->find(oba.first) != excluded->end() ||
+                         excluded->find(oba.second) != excluded->end()))
             continue;    // don't copy from excluded list
-        new_block_aliases[alias->first] = alias->second;
+        new_block_aliases[oba.first] = oba.second;
     }
 }
 
@@ -2129,9 +2149,11 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
             if (op->argread(i))
                 use_stale_sym (oparg(*op,i));
         }
+
+        const OpDescriptor *opd = shadingsys().op_descriptor (op->opname());
         // If it's a simple assignment and the lvalue is "stale", go
         // back and eliminate its last assignment.
-        if (is_simple_assign(*op))
+        if (is_simple_assign(*op, opd))
             simple_sym_assign (oparg (*op, 0), opnum);
         // Make sure there's room for several more symbols, so that we
         // can add a few consts if we need to, without worrying about
@@ -2140,7 +2162,6 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
         // For various ops that we know how to effectively
         // constant-fold, dispatch to the appropriate routine.
         if (optimize() >= 2 && m_opt_constant_fold) {
-            const OpDescriptor *opd = shadingsys().op_descriptor (op->opname());
             if (opd && opd->folder) {
                 int c = (*opd->folder) (*this, opnum);
                 if (c) {
@@ -2161,7 +2182,8 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
         // Now we handle assignments.
         if (optimize() >= 2 && op->opname() == u_assign && m_opt_assign)
             changed += optimize_assignment (*op, opnum);
-        if (optimize() >= 2 && m_opt_elide_useless_ops)
+        if (optimize() >= 2 && m_opt_elide_useless_ops && opd
+            && !(opd->flags & OpDescriptor::SideEffects))
             changed += useless_op_elision (*op, opnum);
         if (m_stop_optimizing)
             break;
@@ -2368,8 +2390,7 @@ RuntimeOptimizer::optimize_instance ()
     // Now that we've optimized this layer, walk through the ops and
     // note which messages may have been sent, so subsequent layers will
     // know.
-    for (int opnum = 0, e = (int)inst()->ops().size();  opnum < e;   ++opnum) {
-        Opcode &op (inst()->ops()[opnum]);
+    for (auto& op : inst()->ops()) {
         if (op.opname() == u_setmessage) {
             Symbol &Name (*inst()->argsymbol(op.firstarg()+0));
             if (Name.is_constant())
@@ -2385,8 +2406,7 @@ RuntimeOptimizer::optimize_instance ()
 void
 RuntimeOptimizer::resolve_isconnected ()
 {
-    for (int i = 0, n = (int)inst()->ops().size();  i < n;  ++i) {
-        Opcode &op (inst()->ops()[i]);
+    for (auto& op : inst()->ops()) {
         if (op.opname() == u_isconnected) {
             inst()->make_symbol_room (1);
             SymbolPtr s = inst()->argsymbol (op.firstarg() + 1);
@@ -3143,7 +3163,8 @@ RuntimeOptimizer::run ()
             // Find interpolated parameters
             if ((s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam)
                 && ! s.lockgeom()) {
-                UserDataNeeded udn (s.name(), s.typespec().simpletype(), s.has_derivs());
+                UserDataNeeded udn (s.name(), layer, s.typespec().simpletype(),
+                                    s.data(), s.has_derivs());
                 std::set<UserDataNeeded>::iterator found;
                 found = m_userdata_needed.find (udn);
                 if (found == m_userdata_needed.end())

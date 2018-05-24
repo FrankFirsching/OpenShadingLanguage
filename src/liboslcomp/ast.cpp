@@ -29,6 +29,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vector>
 #include <string>
 #include <sstream>
+#include <functional>
+#ifndef NDEBUG
+#include <atomic>
+#endif
 
 #include "osl_pvt.h"
 #include "oslcomp_pvt.h"
@@ -36,6 +40,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/strutil.h>
+#include <OpenImageIO/atomic.h>
 namespace Strutil = OIIO::Strutil;
 
 OSL_NAMESPACE_ENTER
@@ -43,11 +48,43 @@ OSL_NAMESPACE_ENTER
 namespace pvt {   // OSL::pvt
 
 
+#ifndef NDEBUG
+// When in DEBUG mode, track the number of AST nodes of each type that
+// are allocated and remaining, and at program exit print a message about
+// any leaked nodes.
+namespace {
+std::atomic<int> node_counts[ASTNode::_last_node];
+std::atomic<int> node_counts_peak[ASTNode::_last_node];
+
+class ScopeExit {
+public:
+    typedef std::function<void()> Task;
+    explicit ScopeExit (Task&& task) : m_task(std::forward<Task>(task)) {}
+    ~ScopeExit () { m_task(); }
+private:
+    Task m_task;
+};
+
+ScopeExit print_node_counts ([](){
+    for (int i = 0; i < ASTNode::_last_node; ++i)
+        if (node_counts[i] > 0)
+            Strutil::printf ("ASTNode type %2d: %5d   (peak %5d)\n",
+                             i, node_counts[i], node_counts_peak[i]);
+});
+}
+#endif
+
+
+
 ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler) 
     : m_nodetype(nodetype), m_compiler(compiler),
       m_sourcefile(compiler->filename()),
       m_sourceline(compiler->lineno()), m_op(0), m_is_lvalue(false)
 {
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
 }
 
 
@@ -59,6 +96,10 @@ ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op,
       m_sourceline(compiler->lineno()), m_op(op), m_is_lvalue(false)
 {
     addchild (a);
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
 }
 
 
@@ -68,6 +109,10 @@ ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op)
       m_sourcefile(compiler->filename()),
       m_sourceline(compiler->lineno()), m_op(op), m_is_lvalue(false)
 {
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
 }
 
 
@@ -80,6 +125,10 @@ ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op,
 {
     addchild (a);
     addchild (b);
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
 }
 
 
@@ -93,6 +142,10 @@ ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op,
     addchild (a);
     addchild (b);
     addchild (c);
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
 }
 
 
@@ -107,30 +160,51 @@ ASTNode::ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op,
     addchild (b);
     addchild (c);
     addchild (d);
+#ifndef NDEBUG
+    node_counts[nodetype] += 1;
+    node_counts_peak[nodetype] += 1;
+#endif
+}
+
+
+
+ASTNode::~ASTNode ()
+{
+#ifndef NDEBUG
+    node_counts[nodetype()] -= 1;
+#endif
 }
 
 
 
 void
-ASTNode::error (const char *format, ...)
+ASTNode::error_impl (string_view msg) const
 {
-    va_list ap;
-    va_start (ap, format);
-    std::string errmsg = format ? Strutil::vformat (format, ap) : "syntax error";
-    va_end (ap);
-    m_compiler->error (sourcefile(), sourceline(), "%s", errmsg.c_str());
+    m_compiler->error (sourcefile(), sourceline(), "%s", msg);
 }
 
 
 
 void
-ASTNode::warning (const char *format, ...)
+ASTNode::warning_impl (string_view msg) const
 {
-    va_list ap;
-    va_start (ap, format);
-    std::string errmsg = format ? Strutil::vformat (format, ap) : "unknown warning";
-    va_end (ap);
-    m_compiler->warning (sourcefile(), sourceline(), "%s", errmsg.c_str());
+    m_compiler->warning (sourcefile(), sourceline(), "%s", msg);
+}
+
+
+
+void
+ASTNode::info_impl (string_view msg) const
+{
+    m_compiler->info (sourcefile(), sourceline(), "%s", msg);
+}
+
+
+
+void
+ASTNode::message_impl (string_view msg) const
+{
+    m_compiler->message (sourcefile(), sourceline(), "%s", msg);
 }
 
 
@@ -174,6 +248,45 @@ const char *
 ASTNode::type_c_str (const TypeSpec &type) const
 {
     return m_compiler->type_c_str (type);
+}
+
+
+
+void
+ASTNode::list_to_vec (const ref &A, std::vector<ref> &vec)
+{
+    vec.clear ();
+    for (ref node = A; node; node = node->next())
+        vec.push_back (node);
+}
+
+
+
+ASTNode::ref
+ASTNode::vec_to_list (std::vector<ref> &vec)
+{
+    if (vec.size()) {
+        for (size_t i = 0;  i < vec.size()-1;  ++i)
+            vec[i]->m_next = vec[i+1];
+        vec[vec.size()-1]->m_next = NULL;
+        return vec[0];
+    } else {
+        return ref();
+    }
+}
+
+
+
+std::string
+ASTNode::list_to_types_string (const ASTNode *node)
+{
+    std::ostringstream result;
+    for (int i = 0; node; node = node->nextptr(), ++i) {
+        if (i)
+            result << ", ";
+        result << node->typespec();
+    }
+    return result.str();
 }
 
 
@@ -231,29 +344,31 @@ ASTshader_declaration::shadertypename () const
 
 ASTfunction_declaration::ASTfunction_declaration (OSLCompilerImpl *comp,
                              TypeSpec type, ustring name,
-                             ASTNode *form, ASTNode *stmts, ASTNode *meta)
+                             ASTNode *form, ASTNode *stmts, ASTNode *meta,
+                             int sourceline_start)
     : ASTNode (function_declaration_node, comp, 0, meta, form, stmts),
       m_name(name), m_sym(NULL), m_is_builtin(false)
 {
-    m_typespec = type;
-    Symbol *f = comp->symtab().clash (name);
-    if (f && f->symtype() != SymTypeFunction) {
-        error ("\"%s\" already declared in this scope as a ", name.c_str(),
-               f->typespec().string().c_str());
+    // Some trickery -- the compiler's idea of the "current" source line
+    // is the END of the function body, so if a hint was passed about the
+    // start of the declaration, substitute that.
+    if (sourceline_start >= 0)
+        m_sourceline = sourceline_start;
+
+    if (Strutil::starts_with (name, "___"))
+        error ("\"%s\" : sorry, can't start with three underscores", name);
+
+    // Get a pointer to the first of the existing symbols of that name.
+    Symbol *existing_syms = comp->symtab().clash (name);
+    if (existing_syms && existing_syms->symtype() != SymTypeFunction) {
+        error ("\"%s\" already declared in this scope as a %s",
+               name, existing_syms->typespec());
         // FIXME -- print the file and line of the other definition
-        f = NULL;
+        existing_syms = NULL;
     }
 
-    // FIXME -- allow multiple function declarations, but only if they
-    // aren't the same polymorphic type.
-
-    if (name[0] == '_' && name[1] == '_' && name[2] == '_') {
-        error ("\"%s\" : sorry, can't start with three underscores",
-               name.c_str());
-    }
-
-    m_sym = new FunctionSymbol (name, type, this);
-    func()->nextpoly ((FunctionSymbol *)f);
+    // Build up the argument signature for this declared function
+    m_typespec = type;
     std::string argcodes = oslcompiler->code_from_type (m_typespec);
     for (ASTNode *arg = form;  arg;  arg = arg->nextptr()) {
         const TypeSpec &t (arg->typespec());
@@ -268,6 +383,44 @@ ASTfunction_declaration::ASTfunction_declaration (OSLCompilerImpl *comp,
             v->error ("function parameter '%s' may not have a default initializer.",
                       v->name().c_str());
     }
+
+    // Allow multiple function declarations, but only if they aren't the
+    // same polymorphic type in the same scope.
+    if (stmts) {
+        std::string err;
+        int current_scope = oslcompiler->symtab().scopeid();
+        for (FunctionSymbol *f = static_cast<FunctionSymbol *>(existing_syms);
+             f; f = f->nextpoly()) {
+            if (f->scope() == current_scope && f->argcodes() == argcodes) {
+                // If the argcodes match, only one should have statements.
+                // If there is no ASTNode for the poly, must be a builtin, and
+                // has 'implicit' statements.
+                auto other = static_cast<ASTfunction_declaration*>(f->node());
+                if (!other || (other->statements() || other->is_builtin())) {
+                    if (err.empty()) {
+                        err = Strutil::format("Function '%s %s (%s)' redefined "
+                                              "in the same scope\n"
+                                              "  Previous definitions:", type,
+                                              name, list_to_types_string(form));
+                    }
+                    err += "\n    ";
+                    if (other) {
+                        err += Strutil::format("%s:%d",
+                                    OIIO::Filesystem::filename(other->sourcefile().string()),
+                                    other->sourceline());
+                    } else
+                        err += "built-in";
+                }
+            }
+        }
+        if (!err.empty())
+            warning ("%s", err);
+    }
+
+
+    m_sym = new FunctionSymbol (name, type, this);
+    func()->nextpoly ((FunctionSymbol *)existing_syms);
+
     func()->argcodes (ustring (argcodes));
     oslcompiler->symtab().insert (m_sym);
 
@@ -278,9 +431,9 @@ ASTfunction_declaration::ASTfunction_declaration (OSLCompilerImpl *comp,
 
 
 void
-ASTfunction_declaration::add_meta (ASTNode *meta)
+ASTfunction_declaration::add_meta (ref metaref)
 {
-    for (  ;  meta;  meta = meta->nextptr()) {
+    for (ASTNode *meta = metaref.get();  meta;  meta = meta->nextptr()) {
         ASSERT (meta->nodetype() == ASTNode::variable_declaration_node);
         const ASTvariable_declaration *metavar = static_cast<const ASTvariable_declaration *>(meta);
         Symbol *metasym = metavar->sym();
@@ -339,12 +492,25 @@ ASTvariable_declaration::ASTvariable_declaration (OSLCompilerImpl *comp,
                                                   const TypeSpec &type,
                                                   ustring name, ASTNode *init,
                                                   bool isparam, bool ismeta,
-                                                  bool isoutput, bool initlist)
+                                                  bool isoutput, bool initlist,
+                                                  int sourceline_start)
     : ASTNode (variable_declaration_node, comp, 0, init, NULL /* meta */),
       m_name(name), m_sym(NULL),
       m_isparam(isparam), m_isoutput(isoutput), m_ismetadata(ismeta),
       m_initlist(initlist)
 {
+    // Some trickery -- the compiler's idea of the "current" source line
+    // is the END of the declaration, so if a hint was passed about the
+    // start of the declaration, substitute that.
+    if (sourceline_start >= 0)
+        m_sourceline = sourceline_start;
+
+    if (m_initlist && init) {
+        // Typecheck the init list early.
+        ASSERT (init->nodetype() == compound_initializer_node);
+        static_cast<ASTcompound_initializer*>(init)->typecheck(type);
+    }
+
     m_typespec = type;
     Symbol *f = comp->symtab().clash (name);
     if (f  &&  ! m_ismetadata) {
@@ -356,14 +522,13 @@ ASTvariable_declaration::ASTvariable_declaration (OSLCompilerImpl *comp,
         }
         if (f->scope() == 0 && f->symtype() == SymTypeFunction && isparam) {
             // special case: only a warning for param to mask global function
-            warning ("%s", e.c_str());
+            warning ("%s", e);
         } else {
-            error ("%s", e.c_str());
+            error ("%s", e);
         }
     }
-    if (name[0] == '_' && name[1] == '_' && name[2] == '_') {
-        error ("\"%s\" : sorry, can't start with three underscores",
-               name.c_str());
+    if (OIIO::Strutil::starts_with (name, "___")) {
+        error ("\"%s\" : sorry, can't start with three underscores", name);
     }
     SymType symtype = isparam ? (isoutput ? SymTypeOutputParam : SymTypeParam)
                               : SymTypeLocal;
@@ -455,11 +620,27 @@ ASTvariable_ref::print (std::ostream &out, int indentlevel) const
 
 
 
+ASTpreincdec::ASTpreincdec (OSLCompilerImpl *comp, int op, ASTNode *expr)
+    : ASTNode (preincdec_node, comp, op, expr)
+{
+    check_symbol_writeability (expr);
+}
+
+
+
 const char *
 ASTpreincdec::childname (size_t i) const
 {
     static const char *name[] = { "expression" };
     return name[i];
+}
+
+
+
+ASTpostincdec::ASTpostincdec (OSLCompilerImpl *comp, int op, ASTNode *expr)
+    : ASTNode (postincdec_node, comp, op, expr)
+{
+    check_symbol_writeability (expr);
 }
 
 
@@ -555,6 +736,8 @@ ASTstructselect::find_fieldsym (int &structid, int &fieldid)
 {
     if (! lvalue()->typespec().is_structure() &&
         ! lvalue()->typespec().is_structure_array()) {
+        error ("type '%s' does not have a member '%s'",
+               type_c_str(lvalue()->typespec()), m_field);
         return NULL;
     }
 
@@ -713,7 +896,8 @@ ASTreturn_statement::childname (size_t i) const
 
 ASTcompound_initializer::ASTcompound_initializer (OSLCompilerImpl *comp,
                                                   ASTNode *exprlist)
-    : ASTNode (compound_initializer_node, comp, Nothing, exprlist)
+    : ASTtype_constructor (compound_initializer_node, comp, TypeSpec(), exprlist),
+      m_ctor(false)
 {
 }
 
@@ -722,7 +906,38 @@ ASTcompound_initializer::ASTcompound_initializer (OSLCompilerImpl *comp,
 const char *
 ASTcompound_initializer::childname (size_t i) const
 {
-    return "expression_list";
+    return canconstruct() ? "args" : "expression_list";
+}
+
+
+
+bool
+ASTNode::check_symbol_writeability (ASTNode *var)
+{
+    if (var->nodetype() == index_node)
+        return check_symbol_writeability (static_cast<ASTindex*>(var)->lvalue().get());
+    if (var->nodetype() == structselect_node)
+        return check_symbol_writeability (static_cast<ASTstructselect*>(var)->lvalue().get());
+
+    Symbol *dest = nullptr;
+    if (var->nodetype() == variable_ref_node)
+        dest = static_cast<ASTvariable_ref*>(var)->sym();
+    else if (var->nodetype() == variable_declaration_node)
+        dest = static_cast<ASTvariable_declaration*>(var)->sym();
+
+    if (dest) {
+        if (dest->readonly()) {
+            if (OSL_VERSION >= 11001)
+                error ("cannot write to \"%s\" (read-only symbol)", dest->name());
+            else
+                warning ("cannot write to \"%s\" (read-only symbol)", dest->name());
+            return false;
+        }
+    } else {
+        // std::cout << "Don't know how to check_symbol_writeability "
+        //           << var->nodetypename() << "\n";
+    }
+    return true;
 }
 
 
@@ -736,6 +951,8 @@ ASTassign_expression::ASTassign_expression (OSLCompilerImpl *comp, ASTNode *var,
         m_op = Assign;
         m_children[1] = new ASTbinary_expression (comp, op, var, expr);
     }
+
+    check_symbol_writeability (var);
 }
 
 
@@ -789,6 +1006,18 @@ ASTassign_expression::opword () const
 
 
 
+ASTunary_expression::ASTunary_expression (OSLCompilerImpl *comp, int op,
+                                          ASTNode *expr)
+    : ASTNode (unary_expression_node, comp, op, expr)
+{
+    // Check for a user-overloaded function for this operator
+    Symbol *sym = comp->symtab().find (ustring::format ("__operator__%s__", opword()));
+    if (sym && sym->symtype() == SymTypeFunction)
+        m_function_overload = (FunctionSymbol *)sym;
+}
+
+
+
 const char *
 ASTunary_expression::childname (size_t i) const
 {
@@ -821,6 +1050,22 @@ ASTunary_expression::opword () const
     case Not   : return "not";
     case Compl : return "compl";
     default: ASSERT (0 && "unknown unary expression");
+    }
+}
+
+
+
+ASTbinary_expression::ASTbinary_expression (OSLCompilerImpl *comp, Operator op,
+                                            ASTNode *left, ASTNode *right)
+    : ASTNode (binary_expression_node, comp, op, left, right)
+{
+    // Check for a user-overloaded function for this operator.
+    // Disallow a few ops from overloading.
+    if (op != And && op != Or) {
+        ustring funcname = ustring::format ("__operator__%s__", opword());
+        Symbol *sym = comp->symtab().find (funcname);
+        if (sym && sym->symtype() == SymTypeFunction)
+            m_function_overload = (FunctionSymbol *)sym;
     }
 }
 
@@ -920,18 +1165,22 @@ ASTtype_constructor::childname (size_t i) const
 
 
 ASTfunction_call::ASTfunction_call (OSLCompilerImpl *comp, ustring name,
-                                    ASTNode *args)
+                                    ASTNode *args, FunctionSymbol *funcsym)
     : ASTNode (function_call_node, comp, 0, args), m_name(name),
+      m_sym(funcsym ? funcsym : comp->symtab().find (name)), // Look it up.
+      m_poly(funcsym),    // Default - resolved symbol or null
       m_argread(~1),      // Default - all args are read except the first
       m_argwrite(1),      // Default - first arg only is written by the op
       m_argtakesderivs(0) // Default - doesn't take derivs
 {
-    m_sym = comp->symtab().find (name);
     if (! m_sym) {
-        error ("function '%s' was not declared in this scope", name.c_str());
+        error ("function '%s' was not declared in this scope", name);
         // FIXME -- would be fun to troll through the symtab and try to
         // find the things that almost matched and offer suggestions.
         return;
+    }
+    if (is_struct_ctr()) {
+        return;  // It's a struct constructor
     }
     if (m_sym->symtype() != SymTypeFunction) {
         error ("'%s' is not a function", name.c_str());
